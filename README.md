@@ -218,6 +218,13 @@ Contributions welcome; keep the honesty contract: no TODOs, no placeholders,
 no mocks in product paths, and every user-visible command documented in this
 README **and** covered by the test suite.
 
+## Community
+
+* **Telegram channel (announcements):** <https://t.me/zagrosgm>
+* **Telegram group (discussion & support):** <https://t.me/zagrosgm_group>
+* **Panel repository:** <https://github.com/ZagrosGM/Zagros>
+* **This repository:** <https://github.com/ZagrosGM/zagros-scripts>
+
 ## License
 
 [AGPL-3.0](LICENSE) — same as the Zagros panel.
