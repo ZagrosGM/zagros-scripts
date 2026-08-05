@@ -1220,7 +1220,13 @@ cmd_doctor() {
         getent hosts "$host" >/dev/null 2>&1 || { dr FAIL "dns" "cannot resolve $host"; dnsok=0; }
     done
     (( dnsok == 1 )) && dr OK "dns" "ghcr.io / api.github.com resolvable"
-    if timeout 8 curl -fsSI -o /dev/null https://ghcr.io/v2/ 2>/dev/null; then dr OK "network egress" "HTTPS to ghcr.io works"; else dr WARN "network egress" "cannot reach ghcr.io/v2 (proxy/firewall?)"; fi
+    local egress_code
+    egress_code="$(curl -sS -o /dev/null -w '%{http_code}' --max-time 8 https://ghcr.io/v2/ 2>/dev/null || true)"
+    if [[ "$egress_code" =~ ^(200|401|405)$ ]]; then
+        dr OK "network egress" "HTTPS to ghcr.io/v2 works (HTTP ${egress_code})"
+    else
+        dr WARN "network egress" "cannot reach ghcr.io/v2 (proxy/firewall? HTTP ${egress_code:-none})"
+    fi
     local fw="none detected"
     if command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -q "Status: active"; then fw="ufw active"
     elif command -v firewall-cmd >/dev/null 2>&1 && firewall-cmd --state >/dev/null 2>&1; then fw="firewalld active"

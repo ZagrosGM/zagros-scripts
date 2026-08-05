@@ -95,8 +95,9 @@ expect_file "$ZAGROS_BIN/zagros" "CLI installed to ZAGROS_BIN"
 expect_out "docker compose up ran" ""   # noop marker
 grep -q 'image: ghcr.io/zagrosgm/zagros:${ZAGROS_IMAGE_TAG:-latest}' "$ZAGROS_HOME/docker-compose.yml" \
     && ok "compose image tag is env-interpolated" || bad "compose image tag is env-interpolated"
-grep -qE '^ZAGROS_IMAGE_TAG=v' "$ZAGROS_HOME/zagros.env" \
-    && ok "env carries resolved release tag" || bad "env carries resolved release tag"
+grep -qE '^ZAGROS_IMAGE_TAG=(v[0-9]|latest$)' "$ZAGROS_HOME/zagros.env" \
+    && ok "env carries resolved tag or documented 'latest' fallback (GitHub API may be rate-limited)" \
+    || bad "env carries resolved release tag"
 grep -qE '^ZAGROS_DATABASE_URL=sqlite:////var/lib/zagros/zagros.db$' "$ZAGROS_HOME/zagros.env" \
     && ok "platform sqlite url" || bad "platform sqlite url"
 grep -qE '^SQLALCHEMY_DATABASE_URL=sqlite:////var/lib/zagros/legacy.db$' "$ZAGROS_HOME/zagros.env" \
