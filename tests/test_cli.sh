@@ -88,19 +88,32 @@ run bash "$SH" install
 expect_rc "bootstrap install rc0" 0
 expect_out "install prints next steps" "Next steps:"
 expect_file "$ZAGROS_HOME/docker-compose.yml" "compose file written"
-expect_file "$ZAGROS_HOME/zagros.env" "env file written"
+expect_file "$ZAGROS_HOME/.env" ".env file written"
+expect_no_file "$ZAGROS_HOME/zagros.env" "no legacy zagros.env written"
 expect_file "$ZAGROS_HOME/.state/install.json" "install state recorded"
 expect_file "$ZAGROS_BIN/zagros" "CLI installed to ZAGROS_BIN"
-[[ "$(stat -c %a "$ZAGROS_HOME/zagros.env")" == "600" ]] && ok "env file is 0600" || bad "env file is 0600"
+[[ "$(stat -c %a "$ZAGROS_HOME/.env")" == "600" ]] && ok ".env file is 0600" || bad ".env file is 0600"
 expect_out "docker compose up ran" ""   # noop marker
 grep -q 'image: ghcr.io/zagrosgm/zagros:${ZAGROS_IMAGE_TAG:-latest}' "$ZAGROS_HOME/docker-compose.yml" \
     && ok "compose image tag is env-interpolated" || bad "compose image tag is env-interpolated"
-grep -qE '^ZAGROS_IMAGE_TAG=(v[0-9]|latest$)' "$ZAGROS_HOME/zagros.env" \
+# config contract: mount-only, NO env injection on the panel service
+grep -q './.env:/code/.env:ro' "$ZAGROS_HOME/docker-compose.yml" \
+    && ok "compose mounts ./.env -> /code/.env (ro)" || bad "compose mounts ./.env -> /code/.env (ro)"
+grep -q 'env_file:' "$ZAGROS_HOME/docker-compose.yml" \
+    && bad "panel service has NO env_file injection" || ok "panel service has NO env_file injection"
+grep -q "open('/code/.env'" "$ZAGROS_HOME/docker-compose.yml" \
+    && ok "healthcheck reads UVICORN_PORT from the mounted file" \
+    || bad "healthcheck reads UVICORN_PORT from the mounted file"
+grep -qE '^UVICORN_HOST=0.0.0.0$' "$ZAGROS_HOME/.env" \
+    && ok "bind host 0.0.0.0 in .env" || bad "bind host 0.0.0.0 in .env"
+grep -qE '^TLS_MODE=auto$' "$ZAGROS_HOME/.env" \
+    && ok "TLS_MODE=auto default in .env" || bad "TLS_MODE=auto default in .env"
+grep -qE '^ZAGROS_IMAGE_TAG=(v[0-9]|latest$)' "$ZAGROS_HOME/.env" \
     && ok "env carries resolved tag or documented 'latest' fallback (GitHub API may be rate-limited)" \
     || bad "env carries resolved release tag"
-grep -qE '^ZAGROS_DATABASE_URL=sqlite:////var/lib/zagros/zagros.db$' "$ZAGROS_HOME/zagros.env" \
+grep -qE '^ZAGROS_DATABASE_URL=sqlite:////var/lib/zagros/zagros.db$' "$ZAGROS_HOME/.env" \
     && ok "platform sqlite url" || bad "platform sqlite url"
-grep -qE '^SQLALCHEMY_DATABASE_URL=sqlite:////var/lib/zagros/legacy.db$' "$ZAGROS_HOME/zagros.env" \
+grep -qE '^SQLALCHEMY_DATABASE_URL=sqlite:////var/lib/zagros/legacy.db$' "$ZAGROS_HOME/.env" \
     && ok "legacy sqlite url (separate file)" || bad "legacy sqlite url (separate file)"
 run bash "$CLI" install; expect_rc "second install refuses" 1
 expect_out "refusal explains" "already installed"
@@ -113,26 +126,43 @@ expect_out "status shows panel" "database:"
 run bash "$CLI" health; expect_rc "health rc0" 0
 expect_out "health payload line" "healthy: db=sqlite"
 run bash "$CLI" version; expect_rc "version rc0" 0
-expect_out "version shows CLI" "zagros CLI     1.0.0-alpha.3"
+expect_out "version shows CLI" "zagros CLI     1.0.0-alpha.4"
 expect_out "version shows panel" "panel version"
 
 # ----------------------------------------------------------------------------- #
-say "t05 config get/set/list/validate"
+say "t05 config show/get/set/reload/validate"
 run bash "$CLI" config get UVICORN_PORT; expect_rc "config get rc0" 0
 [[ "$LAST_OUT" == "8000" ]] && ok "config get value" || bad "config get value" "$LAST_OUT"
 run bash "$CLI" config set XRAY_SUBSCRIPTION_PORT 2096 --force
 expect_rc "config set rc0" 0
 run bash "$CLI" config get XRAY_SUBSCRIPTION_PORT
 [[ "$LAST_OUT" == "2096" ]] && ok "config set persisted" || bad "config set persisted" "$LAST_OUT"
-run bash "$CLI" config list; expect_rc "config list rc0" 0
+INODE_BEFORE="$(stat -c %i "$ZAGROS_HOME/.env")"
+run bash "$CLI" config set XRAY_SUBSCRIPTION_PATH sub2 --force
+[[ "$(stat -c %i "$ZAGROS_HOME/.env")" == "$INODE_BEFORE" ]] \
+    && ok "config set edits in place (same inode — mount keeps seeing it)" \
+    || bad "config set edits in place (same inode — mount keeps seeing it)"
+run bash "$CLI" config set XRAY_SUBSCRIPTION_PATH sub --force
+run bash "$CLI" config show; expect_rc "config show rc0" 0
 printf '%s' "$LAST_OUT" | grep -q '^ZAGROS_SECRET_KEY=.\{4\}….\{4\}$' \
-    && ok "config list masks secrets" || bad "config list masks secrets"
+    && ok "config show masks secrets" || bad "config show masks secrets"
+run bash "$CLI" config list; expect_rc "config list alias rc0" 0
+run bash "$CLI" config path
+[[ "$LAST_OUT" == "$ZAGROS_HOME/.env" ]] && ok "config path prints .env" || bad "config path prints .env" "$LAST_OUT"
+run bash "$CLI" config reload; expect_rc "config reload rc0" 0
 run bash "$CLI" config validate; expect_rc "config validate rc0" 0
-OLD_LEGACY="$(grep '^SQLALCHEMY_DATABASE_URL=' "$ZAGROS_HOME/zagros.env")"
-sed -i 's|^SQLALCHEMY_DATABASE_URL=.*|SQLALCHEMY_DATABASE_URL=sqlite:////var/lib/zagros/zagros.db|' "$ZAGROS_HOME/zagros.env"
+run bash "$CLI" config set TLS_MODE bogus --force
+run bash "$CLI" config validate; expect_rc "validate rejects bad TLS_MODE" 1
+expect_out "TLS_MODE message" "TLS_MODE invalid"
+run bash "$CLI" config set TLS_MODE on --force
+run bash "$CLI" config validate; expect_rc "validate demands certs when TLS_MODE=on" 1
+run bash "$CLI" config set TLS_MODE auto --force
+run bash "$CLI" config validate; expect_rc "validate clean after TLS revert" 0
+OLD_LEGACY="$(grep '^SQLALCHEMY_DATABASE_URL=' "$ZAGROS_HOME/.env")"
+sed -i 's|^SQLALCHEMY_DATABASE_URL=.*|SQLALCHEMY_DATABASE_URL=sqlite:////var/lib/zagros/zagros.db|' "$ZAGROS_HOME/.env"
 run bash "$CLI" config validate; expect_rc "validate catches same-file collision" 1
 expect_out "collision message" "SAME file"
-sed -i "s|^SQLALCHEMY_DATABASE_URL=.*|$OLD_LEGACY|" "$ZAGROS_HOME/zagros.env"
+sed -i "s|^SQLALCHEMY_DATABASE_URL=.*|$OLD_LEGACY|" "$ZAGROS_HOME/.env"
 run bash "$CLI" config validate; expect_rc "validate clean again" 0
 
 # ----------------------------------------------------------------------------- #
@@ -201,7 +231,7 @@ expect_file "$ARCHIVE" "archive exists"
 X="$T/verify"; mkdir -p "$X"; tar -xzf "$ARCHIVE" -C "$X"
 expect_file "$X/db/zagros.sqlite3" "platform db dump present"
 expect_file "$X/db/legacy.sqlite3" "legacy db dump present"
-expect_file "$X/config/zagros.env" "env in backup"
+expect_file "$X/config/.env" ".env in backup"
 expect_file "$X/config/docker-compose.yml" "compose in backup"
 expect_file "$X/data/panel-data.tar.gz" "panel data tarball"
 expect_file "$X/manifest.meta" "manifest meta"
@@ -236,12 +266,12 @@ expect_out "refusal names engines" "database kind mismatch"
 
 rm -f "$ZAGROS_DATA/wg-marker.conf"
 PLATFORM_SUM_BEFORE="$(grep -A1 . "$X/db/zagros.sqlite3" | sha256sum | cut -d' ' -f1)"
-sed -i 's|^UVICORN_PORT=.*|UVICORN_PORT=9999|' "$ZAGROS_HOME/zagros.env"
+sed -i 's|^UVICORN_PORT=.*|UVICORN_PORT=9999|' "$ZAGROS_HOME/.env"
 run bash "$CLI" restore latest --yes
 expect_rc "restore rc0" 0
 expect_out "restore completes" "restore complete"
 expect_file "$ZAGROS_DATA/wg-marker.conf" "marker file restored"
-grep -q '^UVICORN_PORT=8000$' "$ZAGROS_HOME/zagros.env" \
+grep -q '^UVICORN_PORT=8000$' "$ZAGROS_HOME/.env" \
     && ok "env restored from backup" || bad "env restored from backup"
 [[ "$(sha256sum "$ZAGROS_DATA/zagros.db" | cut -d' ' -f1)" == "$PLATFORM_SUM_BEFORE" ]] \
     && ok "platform db bytes restored" || bad "platform db bytes restored"
@@ -251,7 +281,7 @@ say "t11 update: happy path, idempotency, failure+auto-rollback"
 run bash "$CLI" update --version v9.9.9-test
 expect_rc "update rc0" 0
 expect_out "update summary" "update complete"
-grep -q '^ZAGROS_IMAGE_TAG=v9.9.9-test$' "$ZAGROS_HOME/zagros.env" \
+grep -q '^ZAGROS_IMAGE_TAG=v9.9.9-test$' "$ZAGROS_HOME/.env" \
     && ok "env tag flipped" || bad "env tag flipped"
 jq -e '.result == "ok" and .to_tag == "v9.9.9-test"' "$ZAGROS_HOME/.state/last-update.json" >/dev/null \
     && ok "last-update.json records success" || bad "last-update.json records success"
@@ -264,7 +294,7 @@ FAKE_COMPOSE_PULL_OK=0; export FAKE_COMPOSE_PULL_OK
 run bash "$CLI" update --version v8.8.8-broken
 expect_rc "failed update exits non-zero" 1
 expect_out "rollback announced" "rolling back"
-grep -q '^ZAGROS_IMAGE_TAG=v9.9.9-test$' "$ZAGROS_HOME/zagros.env" \
+grep -q '^ZAGROS_IMAGE_TAG=v9.9.9-test$' "$ZAGROS_HOME/.env" \
     && ok "tag rolled back to previous" || bad "tag rolled back to previous"
 unset FAKE_COMPOSE_PULL_OK
 run bash "$CLI" rollback --to v9.8.7-prev --yes
@@ -330,20 +360,20 @@ run bash "$CLI" up
 
 # ----------------------------------------------------------------------------- #
 say "t15 repair fixes drift, guards the secret key"
-sed -i '/^UVICORN_PORT=/d' "$ZAGROS_HOME/zagros.env"
+sed -i '/^UVICORN_PORT=/d' "$ZAGROS_HOME/.env"
 run bash "$CLI" repair
 expect_rc "repair rc0" 0
-grep -q '^UVICORN_PORT=8000$' "$ZAGROS_HOME/zagros.env" \
+grep -q '^UVICORN_PORT=8000$' "$ZAGROS_HOME/.env" \
     && ok "repair re-added missing UVICORN_PORT" || bad "repair re-added missing UVICORN_PORT"
-SECRET_LINE="$(grep '^ZAGROS_SECRET_KEY=' "$ZAGROS_HOME/zagros.env")"
-sed -i '/^ZAGROS_SECRET_KEY=/d' "$ZAGROS_HOME/zagros.env"
+SECRET_LINE="$(grep '^ZAGROS_SECRET_KEY=' "$ZAGROS_HOME/.env")"
+sed -i '/^ZAGROS_SECRET_KEY=/d' "$ZAGROS_HOME/.env"
 touch "$ZAGROS_DATA/zagros.db"
 run bash "$CLI" repair
 expect_rc "repair with missing secret still rc0" 0
 expect_out "refuses to invent key over data" "NOT inventing a new key"
-grep -q '^ZAGROS_SECRET_KEY=' "$ZAGROS_HOME/zagros.env" \
+grep -q '^ZAGROS_SECRET_KEY=' "$ZAGROS_HOME/.env" \
     && bad "secret left untouched" || ok "secret left untouched"
-sed -i "1i $SECRET_LINE" "$ZAGROS_HOME/zagros.env"
+sed -i "1i $SECRET_LINE" "$ZAGROS_HOME/.env"
 
 # ----------------------------------------------------------------------------- #
 say "t16 uninstall (soft) then reinstall + purge"
@@ -383,6 +413,87 @@ expect_rc "restore without confirmation aborts" 1
 
 run bash "$ZAGROS_BIN/zagros" uninstall --purge --yes
 expect_rc "cleanup purge rc0" 0
+
+# ----------------------------------------------------------------------------- #
+say "t18 legacy zagros.env auto-migrates to .env (any command triggers it)"
+reset_fake
+rm -rf "$ZAGROS_HOME"; mkdir -p "$ZAGROS_HOME"
+printf 'UVICORN_PORT=8123\nZAGROS_SECRET_KEY=abcdefghijklmnopqrstuvwxyz0123456789abcdef\n' \
+    > "$ZAGROS_HOME/zagros.env"
+chmod 644 "$ZAGROS_HOME/zagros.env"
+run bash "$CLI" version
+expect_rc "trigger command rc0" 0
+expect_out "migration logged" "migrated legacy zagros.env"
+expect_file "$ZAGROS_HOME/.env" ".env created by migration"
+[[ "$(stat -c %a "$ZAGROS_HOME/.env")" == "600" ]] \
+    && ok "migrated .env is 0600" || bad "migrated .env is 0600"
+expect_no_file "$ZAGROS_HOME/zagros.env" "legacy file renamed away"
+expect_file "$ZAGROS_HOME/zagros.env.migrated" "legacy kept as .migrated"
+grep -q '^UVICORN_PORT=8123$' "$ZAGROS_HOME/.env" \
+    && ok "values preserved through migration" || bad "values preserved through migration"
+run bash "$CLI" version
+expect_rc "second run rc0" 0
+[[ -f "$ZAGROS_HOME/zagros.env.migrated" && ! -e "$ZAGROS_HOME/zagros.env" ]] \
+    && ok "migration is idempotent" || bad "migration is idempotent"
+# existing .env wins — a legacy file left next to it is NOT migrated over it
+printf 'UVICORN_PORT=9999\n' > "$ZAGROS_HOME/zagros.env"
+run bash "$CLI" version
+grep -q '^UVICORN_PORT=8123$' "$ZAGROS_HOME/.env" \
+    && ok "existing .env untouched when legacy reappears" \
+    || bad "existing .env untouched when legacy reappears"
+rm -f "$ZAGROS_HOME/zagros.env"
+
+# ----------------------------------------------------------------------------- #
+say "t19 legacy backup archive (zagros.env + injection compose) restores into .env"
+reset_fake
+rm -rf "$ZAGROS_HOME"
+run bash "$CLI" install
+expect_rc "fresh install rc0" 0
+LEGARC="$T/legacy-archive"; mkdir -p "$LEGARC/config" "$LEGARC/db"
+cp -a "$ZAGROS_HOME/.env" "$LEGARC/config/zagros.env"
+sed -i 's|^UVICORN_PORT=.*|UVICORN_PORT=7777|' "$LEGARC/config/zagros.env"
+# old-style injection compose (no /code/.env mount marker) — must normalize
+printf 'services:\n  zagros:\n    env_file:\n      - zagros.env\n' \
+    > "$LEGARC/config/docker-compose.yml"
+touch "$ZAGROS_DATA/zagros.db"   # fake docker creates no real sqlite file
+cp -a "$ZAGROS_DATA/zagros.db" "$LEGARC/db/zagros.sqlite3"
+printf 'kind=zagros-full\ndb_kind=sqlite\n' > "$LEGARC/manifest.meta"
+tar -czf "$T/legacy-backup.tar.gz" -C "$LEGARC" .
+run bash "$CLI" restore "$T/legacy-backup.tar.gz" --yes
+expect_rc "legacy archive restore rc0" 0
+expect_out "legacy env restore logged" "restored into .env"
+expect_out "legacy compose conversion logged" "mount-only .env design"
+grep -q '^UVICORN_PORT=7777$' "$ZAGROS_HOME/.env" \
+    && ok "legacy env restored INTO .env" || bad "legacy env restored INTO .env"
+grep -q './.env:/code/.env:ro' "$ZAGROS_HOME/docker-compose.yml" \
+    && ok "compose normalized to the mount design" || bad "compose normalized to the mount design"
+grep -q 'env_file:' "$ZAGROS_HOME/docker-compose.yml" \
+    && bad "no env_file injection left after normalize" || ok "no env_file injection left after normalize"
+run bash "$CLI" uninstall --purge --yes
+expect_rc "t19 cleanup rc0" 0
+
+# ----------------------------------------------------------------------------- #
+say "t20 mysql install: creds ONLY in .env, compose is interpolation-only"
+reset_fake
+rm -rf "$ZAGROS_HOME"
+run bash "$CLI" install --database mysql
+expect_rc "mysql install rc0" 0
+grep -qE '^ZAGROS_DB_ROOT_PASSWORD=.+$' "$ZAGROS_HOME/.env" \
+    && ok "db root password lives in .env" || bad "db root password lives in .env"
+grep -qE '^ZAGROS_DB_PASSWORD=.+$' "$ZAGROS_HOME/.env" \
+    && ok "db password lives in .env" || bad "db password lives in .env"
+grep -q '${ZAGROS_DB_USER:-zagros}' "$ZAGROS_HOME/docker-compose.yml" \
+    && ok "compose interpolates db user from .env" || bad "compose interpolates db user from .env"
+ROOT_PW="$(grep '^ZAGROS_DB_ROOT_PASSWORD=' "$ZAGROS_HOME/.env" | cut -d= -f2-)"
+grep -qF "$ROOT_PW" "$ZAGROS_HOME/docker-compose.yml" \
+    && bad "compose stays secret-free (no literal creds)" \
+    || ok "compose stays secret-free (no literal creds)"
+grep -q 'env_file:' "$ZAGROS_HOME/docker-compose.yml" \
+    && bad "mysql stack: no env_file injection" || ok "mysql stack: no env_file injection"
+grep -q './.env:/code/.env:ro' "$ZAGROS_HOME/docker-compose.yml" \
+    && ok "mysql stack: .env mounted" || bad "mysql stack: .env mounted"
+run bash "$CLI" uninstall --purge --yes
+expect_rc "t20 cleanup rc0" 0
 
 # ----------------------------------------------------------------------------- #
 printf '\n==============================================================\n'
