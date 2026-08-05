@@ -1,0 +1,1719 @@
+#!/usr/bin/env bash
+# =============================================================================
+#  Zagros — host management CLI
+# =============================================================================
+#  Enterprise Multi-Core VPN Management Platform
+#  Repository: https://github.com/ZagrosGM/Zagros
+#  Installer : https://github.com/ZagrosGM/zagros-scripts
+#
+#  Design goals:
+#   * single self-contained file (installed to /usr/local/bin/zagros) —
+#     it never depends on the scripts repository being present on disk;
+#   * every operation is real: docker/compose for the service lifecycle,
+#     `python3 -m app.platform.hostctl` inside the container for panel
+#     operations (cores, admins, db, sync) — no mocks, no hidden state;
+#   * no core has a special place: cores install at runtime via SELF_INSTALL;
+#     this CLI knows nothing about any specific core's internals;
+#   * honest reporting: failures surface with exit codes and messages,
+#     nothing is simulated or silently skipped.
+#
+#  Layout (all overridable via environment for tests):
+#   /opt/zagros          ZAGROS_HOME   compose file, env, CLI state
+#   /var/lib/zagros      ZAGROS_DATA   panel data, cores, backups, logs
+#   /usr/local/bin       ZAGROS_BIN    this CLI
+# =============================================================================
+set -euo pipefail
+
+ZAGROS_CLI_VERSION="1.0.0-alpha.3"
+SCRIPTS_REPO_RAW="https://raw.githubusercontent.com/ZagrosGM/zagros-scripts"
+PANEL_REPO="ZagrosGM/Zagros"
+PANEL_API="https://api.github.com/repos/${PANEL_REPO}"
+IMAGE_REPO="ghcr.io/zagrosgm/zagros"
+
+ZAGROS_HOME="${ZAGROS_HOME:-/opt/zagros}"
+ZAGROS_DATA="${ZAGROS_DATA:-/var/lib/zagros}"
+ZAGROS_BIN="${ZAGROS_BIN:-/usr/local/bin}"
+ZAGROS_SCRIPTS_REF="${ZAGROS_SCRIPTS_REF:-main}"
+COMPOSE_FILE="$ZAGROS_HOME/docker-compose.yml"
+ENV_FILE="$ZAGROS_HOME/zagros.env"
+STATE_DIR="$ZAGROS_HOME/.state"
+BACKUP_DIR="$ZAGROS_DATA/backups"
+SERVICE="zagros"
+DB_SERVICE="zagros-db"
+
+# --------------------------------------------------------------------------- #
+#  logging                                                                    #
+# --------------------------------------------------------------------------- #
+if [[ -t 1 && -z "${NO_COLOR:-}" ]]; then
+    C_RED=$'\033[0;31m'; C_GRN=$'\033[0;32m'; C_YEL=$'\033[0;33m'
+    C_BLU=$'\033[0;34m'; C_BLD=$'\033[1m';    C_RST=$'\033[0m'
+else
+    C_RED=""; C_GRN=""; C_YEL=""; C_BLU=""; C_BLD=""; C_RST=""
+fi
+log_info() { printf '%s[*]%s %s\n'  "$C_BLU" "$C_RST" "$*"; }
+log_ok()   { printf '%s[✓]%s %s\n'  "$C_GRN" "$C_RST" "$*"; }
+log_warn() { printf '%s[!]%s %s\n'  "$C_YEL" "$C_RST" "$*" >&2; }
+log_err()  { printf '%s[✗]%s %s\n'  "$C_RED" "$C_RST" "$*" >&2; }
+log_step() { printf '%s%s==>%s %s\n' "$C_BLD"  "$C_BLU" "$C_RST" "$*"; }
+die()      { log_err "$*"; exit 1; }
+confirm()  {  # confirm "question"; respects ASSUME_YES=1
+    if [[ "${ASSUME_YES:-0}" == "1" ]]; then return 0; fi
+    local reply
+    read -r -p "$1 [y/N] " reply
+    [[ "$reply" =~ ^[Yy]([Ee][Ss])?$ ]]
+}
+
+# --------------------------------------------------------------------------- #
+#  prerequisites                                                              #
+# --------------------------------------------------------------------------- #
+require_root() { [[ "$(id -u)" -eq 0 ]] || die "this command must run as root (use sudo)."; }
+require_cmd()  { command -v "$1" >/dev/null 2>&1 || die "required command '$1' is missing. $2"; }
+
+_pkg_install() {  # _pkg_install <pkg...> — best-effort install across distros
+    local pkgs=("$@")
+    if   command -v apt-get >/dev/null 2>&1; then apt-get update -qq && DEBIAN_FRONTEND=noninteractive apt-get install -y -qq "${pkgs[@]}"
+    elif command -v dnf     >/dev/null 2>&1; then dnf install -y "${pkgs[@]}"
+    elif command -v yum     >/dev/null 2>&1; then yum install -y "${pkgs[@]}"
+    elif command -v zypper  >/dev/null 2>&1; then zypper --non-interactive install "${pkgs[@]}"
+    elif command -v pacman  >/dev/null 2>&1; then pacman -Sy --noconfirm "${pkgs[@]}"
+    elif command -v apk     >/dev/null 2>&1; then apk add --no-cache "${pkgs[@]}"
+    else return 1; fi
+}
+
+ensure_cmd() {  # ensure_cmd <cmd> <pkg> — install if root, else actionable error
+    local cmd="$1" pkg="$2"
+    if command -v "$cmd" >/dev/null 2>&1; then return 0; fi
+    if [[ "$(id -u)" -eq 0 ]] && _pkg_install "$pkg"; then
+        command -v "$cmd" >/dev/null 2>&1 && return 0
+    fi
+    die "missing '$cmd' and automatic install failed — install package '$pkg' manually."
+}
+
+ensure_docker() {
+    if command -v docker >/dev/null 2>&1; then return 0; fi
+    [[ "${AUTO_INSTALL_DOCKER:-1}" == "1" ]] || die "docker is not installed and --no-docker-install was given. Install Docker: https://docs.docker.com/engine/install/"
+    log_step "Docker not found — installing via the official get.docker.com script"
+    require_cmd curl
+    curl -fsSL https://get.docker.com -o /tmp/zagros-get-docker.sh
+    sh /tmp/zagros-get-docker.sh
+    rm -f /tmp/zagros-get-docker.sh
+    if command -v systemctl >/dev/null 2>&1; then
+        systemctl enable --now docker >/dev/null 2>&1 || true
+    fi
+    command -v docker >/dev/null 2>&1 || die "docker installation finished but 'docker' is still unavailable."
+    log_ok "Docker installed: $(docker --version | head -1)"
+}
+
+compose_probe() {  # sets global COMPOSE=(...)
+    if docker compose version >/dev/null 2>&1; then COMPOSE=(docker compose)
+    elif command -v docker-compose >/dev/null 2>&1; then COMPOSE=(docker-compose)
+    else die "Neither the Docker Compose plugin nor 'docker-compose' is available. Install the compose plugin: https://docs.docker.com/compose/install/linux/"; fi
+}
+compose()     { compose_probe; "${COMPOSE[@]}" -f "$COMPOSE_FILE" --env-file "$ENV_FILE" "$@"; }
+panel_exec()  { compose exec -T "$SERVICE" "$@"; }
+hostctl()     { panel_exec python3 -m app.platform.hostctl "$@"; }
+
+# hostctl_json <args...> — runs hostctl, asserts ok:true, prints payload
+hostctl_json() {
+    ensure_cmd jq jq >/dev/null
+    local out
+    if ! out="$(hostctl "$@" 2>/dev/null)"; then
+        hostctl "$@" >/dev/null 2>&1 || true
+        die "panel operation failed: hostctl $* (panel container running? try: zagros status)"
+    fi
+    if [[ "$(printf '%s' "$out" | jq -r '.ok')" != "true" ]]; then
+        printf '%s\n' "$out" | jq -r '"error: \(.error) [code: \(.code // "n/a")]"' >&2
+        return 1
+    fi
+    printf '%s\n' "$out"
+}
+
+# --------------------------------------------------------------------------- #
+#  env file helpers                                                           #
+# --------------------------------------------------------------------------- #
+env_get() {  # env_get KEY — value from $ENV_FILE (empty if absent)
+    [[ -f "$ENV_FILE" ]] || { printf ''; return 0; }
+    grep -E "^$1=" "$ENV_FILE" | tail -1 | cut -d= -f2-
+}
+env_set() {  # env_set KEY VALUE
+    local key="$1" value="$2"
+    [[ "$key" =~ ^[A-Z][A-Z0-9_]*$ ]] || die "invalid env key: $key"
+    touch "$ENV_FILE"
+    if grep -qE "^$key=" "$ENV_FILE"; then
+        sed -i "s|^$key=.*|$key=$value|" "$ENV_FILE"
+    else
+        printf '%s=%s\n' "$key" "$value" >> "$ENV_FILE"
+    fi
+}
+mask_secret() { local v="$1"; if ((${#v} > 8)); then printf '%s…%s' "${v:0:4}" "${v: -4}"; else printf '****'; fi; }
+gen_secret() { openssl rand -hex "${1:-24}"; }
+
+# --------------------------------------------------------------------------- #
+#  versioning                                                                 #
+# --------------------------------------------------------------------------- #
+version_gt() {  # version_gt A B → true if A > B (dotted numeric compare)
+    local a="${1#v}" b="${2#v}"
+    local -a av bv
+    IFS=. read -r -a av <<< "$a"
+    IFS=. read -r -a bv <<< "$b"
+    local i n=$((${#av[@]} > ${#bv[@]} ? ${#av[@]} : ${#bv[@]})) x y
+    for ((i = 0; i < n; i++)); do
+        x="${av[i]:-0}"; y="${bv[i]:-0}"
+        x="${x%%[!0-9]*}"; y="${y%%[!0-9]*}"   # strip prerelease suffix per segment
+        x="${x:-0}"; y="${y:-0}"
+        ((10#$x > 10#$y)) && return 0
+        ((10#$x < 10#$y)) && return 1
+    done
+    return 1
+}
+
+# resolve_version [stable|latest] — newest release tag from GitHub; falls back
+# to the currently installed tag, then to the literal 'latest'
+resolve_version() {
+    local channel="${1:-stable}" json tag
+    if json="$(curl -fsS --max-time 20 "$PANEL_API/releases?per_page=30" 2>/dev/null)"; then
+        if [[ "$channel" == "stable" ]]; then
+            tag="$(printf '%s' "$json" | jq -r '[.[] | select(.prerelease == false)][0].tag_name // empty' 2>/dev/null)"
+        fi
+        [[ -n "${tag:-}" ]] || tag="$(printf '%s' "$json" | jq -r '.[0].tag_name // empty' 2>/dev/null)"
+        [[ -n "$tag" && "$tag" != "null" ]] && { printf '%s' "$tag"; return 0; }
+    fi
+    local cur
+    cur="$(env_get ZAGROS_IMAGE_TAG)"
+    [[ -n "$cur" ]] && { printf '%s' "$cur"; return 0; }
+    printf 'latest'
+}
+
+ghcr_token() {
+    curl -fsS --max-time 20 \
+        "https://ghcr.io/token?service=ghcr.io&scope=repository:zagrosgm/zagros:pull" \
+        | jq -r '.token'
+}
+
+ghcr_remote_digest() {  # ghcr_remote_digest <tag> → sha256:… (empty on failure)
+    local tag="$1" token
+    token="$(ghcr_token 2>/dev/null)" || return 1
+    curl -fsSI --max-time 20 \
+        -H "Authorization: Bearer $token" \
+        -H "Accept: application/vnd.oci.image.index.v1+json,application/vnd.docker.distribution.manifest.list.v2+json,application/vnd.docker.distribution.manifest.v2+json" \
+        "https://ghcr.io/v2/zagrosgm/zagros/manifests/$tag" 2>/dev/null \
+        | grep -i '^docker-content-digest:' | awk '{print $2}' | tr -d '\r'
+}
+
+local_image_digest() {  # local_image_digest <tag> → sha256:… (empty if absent)
+    docker image inspect "$IMAGE_REPO:$1" \
+        --format '{{range .RepoDigests}}{{println .}}{{end}}' 2>/dev/null \
+        | grep -m1 '^'"$IMAGE_REPO@" | sed "s|^$IMAGE_REPO@||"
+}
+
+# --------------------------------------------------------------------------- #
+#  health                                                                     #
+# --------------------------------------------------------------------------- #
+wait_healthy() {  # wait_healthy <container> <seconds>
+    local name="$1" deadline=$(( $(date +%s) + ${2:-120} )) status
+    while (( $(date +%s) < deadline )); do
+        status="$(docker inspect --format '{{if .State.Health}}{{.State.Health.Status}}{{else}}{{.State.Status}}{{end}}' "$name" 2>/dev/null || echo missing)"
+        case "$status" in
+            healthy|running) return 0 ;;
+            exited|dead|missing) return 1 ;;
+        esac
+        sleep 2
+    done
+    return 1
+}
+
+panel_version() { hostctl version 2>/dev/null | jq -r '.panel_version // "unknown"' 2>/dev/null || echo unknown; }
+
+# --------------------------------------------------------------------------- #
+#  compose templates (self-contained — no repo checkout needed)               #
+# --------------------------------------------------------------------------- #
+render_compose() {  # render_compose <db-kind> — writes $COMPOSE_FILE
+    local db_kind="$1"
+    local panel_svc db_svc
+    panel_svc=$(cat <<'YAML'
+services:
+  zagros:
+    # The tag is interpolated by compose from zagros.env (--env-file), so
+    # `zagros update` only needs to flip ZAGROS_IMAGE_TAG and re-pull.
+    image: __IMAGE_REPO__:${ZAGROS_IMAGE_TAG:-latest}
+    container_name: zagros
+    restart: always
+    network_mode: host
+    env_file:
+      - zagros.env
+    volumes:
+      - __DATA_DIR__:/var/lib/zagros
+    healthcheck:
+      test: ["CMD", "python3", "-c", "import os,urllib.request;urllib.request.urlopen('http://127.0.0.1:'+str(int(os.environ.get('UVICORN_PORT','8000')))+'/zagros/dashboard',timeout=3).close()"]
+      interval: 20s
+      timeout: 8s
+      retries: 6
+      start_period: 45s
+YAML
+)
+    case "$db_kind" in
+        mysql|mariadb)
+            local img="mysql:8.4"
+            [[ "$db_kind" == "mariadb" ]] && img="mariadb:11.5"
+            db_svc=$(cat <<YAML
+
+  zagros-db:
+    image: $img
+    container_name: zagros-db
+    restart: always
+    network_mode: host
+    command: ["--port=__DB_PORT__", "--character-set-server=utf8mb4", "--collation-server=utf8mb4_unicode_ci"]
+    environment:
+      MYSQL_ROOT_PASSWORD: __DB_ROOT_PASSWORD__
+      MYSQL_DATABASE: zagros
+      MYSQL_USER: __DB_USER__
+      MYSQL_PASSWORD: __DB_PASSWORD__
+    volumes:
+      - __DATA_DIR__/db:/var/lib/mysql
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "127.0.0.1", "--port=__DB_PORT__", "--silent", "--password=__DB_ROOT_PASSWORD__"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 40s
+YAML
+)
+            ;;
+        postgresql)
+            db_svc=$(cat <<'YAML'
+
+  zagros-db:
+    image: postgres:17
+    container_name: zagros-db
+    restart: always
+    network_mode: host
+    command: ["-p", "__DB_PORT__"]
+    environment:
+      POSTGRES_DB: zagros
+      POSTGRES_USER: __DB_USER__
+      POSTGRES_PASSWORD: __DB_PASSWORD__
+    volumes:
+      - __DATA_DIR__/db:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U __DB_USER__ -d zagros -p __DB_PORT__ -h 127.0.0.1"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 30s
+YAML
+)
+            ;;
+        *) db_svc="" ;;
+    esac
+    printf '%s%s\n' "$panel_svc" "$db_svc" > "$COMPOSE_FILE.tmp"
+    sed -i \
+        -e "s|__IMAGE_REPO__|$IMAGE_REPO|g" \
+        -e "s|__DATA_DIR__|$ZAGROS_DATA|g" \
+        "$COMPOSE_FILE.tmp"
+    mv "$COMPOSE_FILE.tmp" "$COMPOSE_FILE"
+    chmod 640 "$COMPOSE_FILE"
+}
+
+# substitute db credentials into the compose file (they live only in files
+# with 600 perms — never on any command line)
+render_db_secrets() {
+    local port="$1" user="$2" password="$3" root_password="${4:-}"
+    sed -i \
+        -e "s|__DB_PORT__|$port|g" \
+        -e "s|__DB_USER__|$user|g" \
+        -e "s|__DB_PASSWORD__|$password|g" \
+        -e "s|__DB_ROOT_PASSWORD__|$root_password|g" \
+        "$COMPOSE_FILE"
+    chmod 640 "$COMPOSE_FILE"
+}
+
+render_env() {  # render_env <db-kind> <image-tag> — writes $ENV_FILE and
+                # prints generated db credentials as KEY=VALUE lines (stdout)
+    local db_kind="$1" tag="$2"
+    local secret legacy_url platform_url db_port="" db_user="" db_pass="" db_root=""
+    secret="$(gen_secret 32)"
+    case "$db_kind" in
+        sqlite)
+            platform_url="sqlite:////var/lib/zagros/zagros.db"
+            legacy_url="sqlite:////var/lib/zagros/legacy.db"
+            ;;
+        mysql|mariadb)
+            db_port="${ZAGROS_DB_PORT:-3306}"
+            db_user="zagros"; db_pass="$(gen_secret 16)"; db_root="$(gen_secret 16)"
+            platform_url="mysql+pymysql://zagros:${db_pass}@127.0.0.1:${db_port}/zagros?charset=utf8mb4"
+            legacy_url="mysql+pymysql://zagros:${db_pass}@127.0.0.1:${db_port}/zagros_legacy?charset=utf8mb4"
+            ;;
+        postgresql)
+            db_port="${ZAGROS_DB_PORT:-5432}"
+            db_user="zagros"; db_pass="$(gen_secret 16)"
+            platform_url="postgresql+psycopg://zagros:${db_pass}@127.0.0.1:${db_port}/zagros"
+            legacy_url="postgresql+psycopg://zagros:${db_pass}@127.0.0.1:${db_port}/zagros_legacy"
+            ;;
+        *) die "unknown database kind: $db_kind (expected sqlite|mysql|mariadb|postgresql)" ;;
+    esac
+    cat > "$ENV_FILE" <<EOF
+# Zagros panel environment — generated by zagros $ZAGROS_CLI_VERSION on $(date -u +%Y-%m-%dT%H:%M:%SZ)
+# Edit via: zagros config edit | zagros config set KEY VALUE
+ZAGROS_IMAGE_TAG=$tag
+ZAGROS_DB_KIND=$db_kind
+ZAGROS_SECRET_KEY=$secret
+ZAGROS_DATABASE_URL=$platform_url
+SQLALCHEMY_DATABASE_URL=$legacy_url
+UVICORN_HOST=0.0.0.0
+UVICORN_PORT=${UVICORN_PORT:-8000}
+ALLOWED_ORIGINS=
+EOF
+    if [[ "$db_kind" != "sqlite" ]]; then
+        {
+            printf 'ZAGROS_DB_PORT=%s\n' "$db_port"
+            printf 'ZAGROS_DB_USER=%s\n' "$db_user"
+            printf 'ZAGROS_DB_PASSWORD=%s\n' "$db_pass"
+        } >> "$ENV_FILE"
+        printf 'DB_PORT=%s\nDB_USER=%s\nDB_PASSWORD=%s\nDB_ROOT_PASSWORD=%s\n' \
+            "$db_port" "$db_user" "$db_pass" "$db_root"
+    fi
+    chmod 600 "$ENV_FILE"
+}
+
+provision_legacy_db() {  # second database on the managed db server
+    local db_kind; db_kind="$(env_get ZAGROS_DB_KIND)"
+    case "$db_kind" in
+        mysql|mariadb)
+            local root_pw
+            root_pw="$(grep -oE 'MYSQL_ROOT_PASSWORD: .*' "$COMPOSE_FILE" | head -1 | cut -d' ' -f2-)"
+            docker exec -e MYSQL_PWD="$root_pw" "$DB_SERVICE" \
+                mysql -h127.0.0.1 --port="$(env_get ZAGROS_DB_PORT)" -uroot \
+                -e "CREATE DATABASE IF NOT EXISTS zagros_legacy CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci; GRANT ALL PRIVILEGES ON zagros_legacy.* TO '$(env_get ZAGROS_DB_USER)'@'%'; FLUSH PRIVILEGES;"
+            ;;
+        postgresql)
+            docker exec -e PGPASSWORD="$(env_get ZAGROS_DB_PASSWORD)" "$DB_SERVICE" \
+                psql -h127.0.0.1 -p "$(env_get ZAGROS_DB_PORT)" -U "$(env_get ZAGROS_DB_USER)" -d zagros -tAc \
+                "SELECT 1 FROM pg_database WHERE datname='zagros_legacy'" | grep -q 1 \
+            || docker exec -e PGPASSWORD="$(env_get ZAGROS_DB_PASSWORD)" "$DB_SERVICE" \
+                psql -h127.0.0.1 -p "$(env_get ZAGROS_DB_PORT)" -U "$(env_get ZAGROS_DB_USER)" -d zagros -c \
+                "CREATE DATABASE zagros_legacy"
+            ;;
+    esac
+}
+
+install_cli_file() {  # install_cli_file — place the running CLI into $ZAGROS_BIN
+    local target="$ZAGROS_BIN/zagros"
+    mkdir -p "$ZAGROS_BIN"
+    if [[ -n "${ZAGROS_CLI_SELF:-}" && -r "$ZAGROS_CLI_SELF" ]]; then
+        install -m 0755 "$ZAGROS_CLI_SELF" "$target"
+    elif [[ "${BASH_SOURCE[0]}" == */zagros && -r "${BASH_SOURCE[0]}" ]]; then
+        install -m 0755 "${BASH_SOURCE[0]}" "$target"
+    else
+        curl -fsSL "$SCRIPTS_REPO_RAW/$ZAGROS_SCRIPTS_REF/zagros" -o "$target"
+        chmod 0755 "$target"
+    fi
+    log_ok "CLI installed → $target"
+}
+
+# --------------------------------------------------------------------------- #
+#  manifest helpers (backup)                                                  #
+# --------------------------------------------------------------------------- #
+write_manifest() {  # write_manifest <staging>
+    local staging="$1"
+    python3 - "$staging" <<'PYEOF' 2>/dev/null || fallback_manifest "$staging"
+import hashlib, json, os, sys, time
+staging = sys.argv[1]
+files = []
+for base, _, names in os.walk(staging):
+    for n in sorted(names):
+        p = os.path.join(base, n)
+        rel = os.path.relpath(p, staging)
+        if rel == "manifest.json" or rel.startswith(".bak"):
+            continue
+        h = hashlib.sha256()
+        with open(p, "rb") as fh:
+            for chunk in iter(lambda: fh.read(1 << 20), b""):
+                h.update(chunk)
+        files.append({"path": rel, "sha256": h.hexdigest(),
+                      "bytes": os.path.getsize(p)})
+mani = {
+    "manifest_version": 1,
+    "created_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+    "files": files,
+}
+with open(os.path.join(staging, "manifest.json"), "w") as fh:
+    json.dump(mani, fh, indent=1)
+PYEOF
+}
+fallback_manifest() {  # no python3 on host — shell manifest
+    local staging="$1"
+    {
+        printf '{\n "manifest_version": 1,\n "created_utc": "%s",\n "files": [\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+        local first=1 f rel sum size
+        while IFS= read -r -d '' f; do
+            rel="${f#"$staging"/}"
+            [[ "$rel" == "manifest.json" ]] && continue
+            sum="$(sha256sum "$f" | awk '{print $1}')"
+            size="$(stat -c %s "$f")"
+            (( first )) || printf ',\n'; first=0
+            printf '  {"path": "%s", "sha256": "%s", "bytes": %s}' "$rel" "$sum" "$size"
+        done < <(find "$staging" -type f -print0)
+        printf '\n ]\n}\n'
+    } > "$staging/manifest.json"
+}
+
+# ============================================================================= #
+#  COMMANDS                                                                     #
+# ============================================================================= #
+
+# ---------------------------------------------------------------- install ---#
+cmd_install() {
+    local db_kind="sqlite" version="" channel="stable"
+    while (($#)); do
+        case "$1" in
+            --database) db_kind="$2"; shift 2 ;;
+            --database=*) db_kind="${1#*=}"; shift ;;
+            --version) version="$2"; shift 2 ;;
+            --version=*) version="${1#*=}"; shift ;;
+            --channel) channel="$2"; shift 2 ;;
+            --channel=*) channel="${1#*=}"; shift ;;
+            --no-docker-install) AUTO_INSTALL_DOCKER=0; shift ;;
+            --help|-h) install_help; return 0 ;;
+            *) die "unknown install option: $1 (see: zagros install --help)" ;;
+        esac
+    done
+    [[ "$db_kind" =~ ^(sqlite|mysql|mariadb|postgresql)$ ]] \
+        || die "--database must be one of: sqlite | mysql | mariadb | postgresql"
+    require_root
+    log_step "Zagros install — database: $db_kind"
+    require_cmd curl
+    ensure_cmd jq jq
+    ensure_cmd openssl openssl
+    ensure_docker
+
+    mkdir -p "$ZAGROS_HOME" "$STATE_DIR" "$ZAGROS_DATA" "$BACKUP_DIR" \
+             "$ZAGROS_DATA/cores" "$ZAGROS_DATA/logs"
+
+    if [[ -f "$ENV_FILE" ]]; then
+        die "Zagros is already installed ($ENV_FILE exists). Use: zagros update | zagros repair | zagros uninstall first."
+    fi
+
+    [[ -n "$version" ]] || version="$(resolve_version "$channel")"
+    log_info "Image: $IMAGE_REPO:$version"
+
+    local creds=""
+    creds="$(render_env "$db_kind" "$version")"
+    render_compose "$db_kind"
+    if [[ "$db_kind" != "sqlite" ]]; then
+        render_db_secrets \
+            "$(printf '%s\n' "$creds" | grep '^DB_PORT=' | cut -d= -f2-)" \
+            "$(printf '%s\n' "$creds" | grep '^DB_USER=' | cut -d= -f2-)" \
+            "$(printf '%s\n' "$creds" | grep '^DB_PASSWORD=' | cut -d= -f2-)" \
+            "$(printf '%s\n' "$creds" | grep '^DB_ROOT_PASSWORD=' | cut -d= -f2-)"
+        unset creds
+    fi
+
+    log_step "Pulling images"
+    compose pull
+    log_step "Starting services"
+    compose up -d
+
+    if [[ "$db_kind" != "sqlite" ]]; then
+        log_step "Waiting for database"
+        wait_healthy "$DB_SERVICE" 150 || die "database did not become healthy — see: zagros logs zagros-db"
+        provision_legacy_db
+        log_ok "Databases ready (zagros + zagros_legacy)"
+    fi
+
+    log_step "Waiting for the panel"
+    if ! wait_healthy "$SERVICE" 240; then
+        log_warn "panel not healthy yet — dumping last log lines:"
+        compose logs --tail=40 "$SERVICE" >&2 || true
+        die "panel failed to become healthy. Investigate with: zagros logs / zagros doctor"
+    fi
+
+    log_step "Verifying schema migration"
+    local check
+    check="$(hostctl db-check 2>/dev/null || true)"
+    if ! printf '%s' "$check" | jq -e '.up_to_date == true' >/dev/null 2>&1; then
+        log_info "running alembic upgrade head"
+        panel_exec python3 -m alembic upgrade head >/dev/null
+        check="$(hostctl db-check 2>/dev/null || true)"
+    fi
+    printf '%s' "$check" | jq -e '.up_to_date == true' >/dev/null 2>&1 \
+        || die "schema migration did not converge: $check"
+    log_ok "Schema up to date ($(printf '%s' "$check" | jq -r '.alembic_heads[0]'))"
+
+    install_cli_file
+    printf '%s\n' "{\"version\": \"$version\", \"db\": \"$db_kind\", \"installed_utc\": \"$(date -u +%Y-%m-%dT%H:%M:%SZ)\"}" \
+        > "$STATE_DIR/install.json"
+
+    log_ok "Zagros $(panel_version) is running (image $version)"
+    cat <<EOF
+
+Next steps:
+  1. Create the first sudo admin:   zagros create-admin --sudo
+  2. Open the dashboard:            http://<server-ip>:$(env_get UVICORN_PORT)/dashboard/
+     Zagros Ops dashboard:          http://<server-ip>:$(env_get UVICORN_PORT)/zagros/dashboard
+     Config Studio:                 http://<server-ip>:$(env_get UVICORN_PORT)/zagros/studio
+  3. Install a core when needed:    zagros install-core <xray|sing-box|hysteria2|tuic|...>
+     (cores self-install their official binaries at runtime — nothing is
+      baked into the image and no core has a special place)
+EOF
+}
+install_help() {
+    cat <<EOF
+zagros install — one-command installation
+
+  --database sqlite|mysql|mariadb|postgresql   database engine (default: sqlite)
+  --version <tag>     pin the panel image tag (default: newest GitHub release)
+  --channel stable|latest   release channel when no --version given
+  --no-docker-install       do not auto-install Docker when missing
+
+Examples:
+  sudo bash -c "\$(curl -fsSL $SCRIPTS_REPO_RAW/main/zagros.sh)" -- install
+  zagros install --database postgresql
+  zagros install --database mysql --version v1.0.0-alpha.3
+EOF
+}
+
+# -------------------------------------------------------------- uninstall ---#
+cmd_uninstall() {
+    local purge=0 yes=0
+    while (($#)); do
+        case "$1" in
+            --purge) purge=1; shift ;;
+            --yes|-y) yes=1; shift ;;
+            *) die "unknown uninstall option: $1" ;;
+        esac
+    done
+    require_root
+    (( yes )) || confirm "Remove Zagros services and $ZAGROS_HOME?" || die "aborted."
+    if [[ -f "$COMPOSE_FILE" ]]; then
+        compose_probe; "${COMPOSE[@]}" -f "$COMPOSE_FILE" --env-file "$ENV_FILE" \
+            down --remove-orphans || log_warn "compose down reported errors (continuing)"
+    fi
+    rm -rf "$ZAGROS_HOME"
+    rm -f  "$ZAGROS_BIN/zagros"
+    log_ok "removed $ZAGROS_HOME and the CLI"
+    if (( purge )); then
+        (( yes )) || confirm "ALSO delete ALL DATA under $ZAGROS_DATA (databases, cores, backups)?" || die "kept data; finished."
+        rm -rf "$ZAGROS_DATA"
+        docker rmi "$(docker images "$IMAGE_REPO" -q)" >/dev/null 2>&1 || true
+        log_ok "purged $ZAGROS_DATA and panel images"
+    else
+        log_info "data kept at $ZAGROS_DATA (use --purge to remove everything)"
+    fi
+    log_ok "Zagros uninstalled."
+}
+
+# ----------------------------------------------------------------- update ---#
+cmd_update() {
+    local version="" channel="stable" no_backup=0 yes=0 force=0
+    while (($#)); do
+        case "$1" in
+            --version) version="$2"; shift 2 ;;
+            --version=*) version="${1#*=}"; shift ;;
+            --channel) channel="$2"; shift 2 ;;
+            --no-backup) no_backup=1; shift ;;
+            --yes|-y) yes=1; shift ;;
+            --force) force=1; shift ;;
+            *) die "unknown update option: $1" ;;
+        esac
+    done
+    require_root; require_installed
+    ensure_cmd jq jq
+    ASSUME_YES=$yes
+    [[ -n "$version" ]] || version="$(resolve_version "$channel")"
+    # release tags are published as vX.Y.Z — accept the bare numeric form too
+    [[ "$version" == v* || "$version" == latest ]] || version="v$version"
+    local current
+    current="$(env_get ZAGROS_IMAGE_TAG)"
+    log_step "Zagros update: ${current:-unknown} → $version"
+
+    if [[ "$current" == "$version" && "$force" == "0" ]]; then
+        local remote local_d
+        remote="$(ghcr_remote_digest "$version" 2>/dev/null || true)"
+        local_d="$(local_image_digest "$version" 2>/dev/null || true)"
+        if [[ -n "$remote" && "$remote" == "$local_d" ]]; then
+            log_ok "already up to date ($version, digest identical)"; return 0
+        fi
+        log_info "same tag but digest differs (or unverifiable) — pulling fresh image"
+    fi
+
+    local backup_path=""
+    if (( ! no_backup )); then
+        log_step "Pre-update backup"
+        backup_path="$(do_backup --no-logs)" || die "pre-update backup failed — aborting update (data comes first)"
+        log_ok "backup: $backup_path"
+    fi
+
+    printf '%s\n' "{\"from_tag\": \"$current\", \"to_tag\": \"$version\", \"started_utc\": \"$(date -u +%Y-%m-%dT%H:%M:%SZ)\", \"backup\": \"$backup_path\"}" \
+        > "$STATE_DIR/last-update.json"
+
+    if update_apply "$version"; then
+        log_ok "update complete → $(panel_version) (image $version)"
+        printf '%s\n' "$(jq --arg t "$(date -u +%Y-%m-%dT%H:%M:%SZ)" '. + {finished_utc: $t, result: "ok"}' "$STATE_DIR/last-update.json")" \
+            > "$STATE_DIR/last-update.json"
+    else
+        log_err "update to $version FAILED — rolling back to ${current:-previous state}"
+        rollback_update "$current" "$backup_path"
+        die "update failed and was rolled back. See: zagros logs"
+    fi
+}
+
+update_apply() {  # update_apply <tag> → 0 ok / 1 fail
+    local version="$1"
+    env_set ZAGROS_IMAGE_TAG "$version"
+    compose pull >/dev/null || { log_err "image pull failed ($version)"; return 1; }
+    compose up -d >/dev/null || { log_err "compose up failed"; return 1; }
+    wait_healthy "$SERVICE" 240 || { log_err "panel did not become healthy"; return 1; }
+    wait_healthy "$DB_SERVICE" 60 >/dev/null 2>&1 || true
+    panel_exec python3 -m alembic upgrade head >/dev/null 2>&1 || { log_err "schema migration failed"; return 1; }
+    hostctl db-check 2>/dev/null | jq -e '.up_to_date == true' >/dev/null 2>&1 \
+        || { log_err "schema not up to date after migration"; return 1; }
+    return 0
+}
+
+rollback_update() {  # rollback_update <prev-tag> <backup>
+    local prev="$1" backup="$2"
+    if [[ -n "$prev" ]]; then
+        env_set ZAGROS_IMAGE_TAG "$prev"
+        compose pull >/dev/null 2>&1 || true
+        compose up -d >/dev/null 2>&1 || true
+        if wait_healthy "$SERVICE" 180; then
+            log_ok "rollback: image $prev is healthy again"
+            printf '%s\n' "$(jq '. + {result: "rolled-back"}' "$STATE_DIR/last-update.json")" \
+                > "$STATE_DIR/last-update.json" 2>/dev/null || true
+            return 0
+        fi
+    fi
+    if [[ -n "$backup" && -f "$backup" ]]; then
+        log_warn "image rollback unhealthy — restoring data backup as last resort"
+        cmd_restore "$backup" --yes || log_err "backup restore also failed — manual intervention required: zagros doctor"
+    else
+        log_err "no rollback path available — run: zagros doctor"
+    fi
+}
+
+cmd_rollback() {
+    require_root; require_installed
+    local to_tag="" backup=""
+    while (($#)); do
+        case "$1" in
+            --to) to_tag="$2"; shift 2 ;;
+            --backup) backup="$2"; shift 2 ;;
+            --yes|-y) ASSUME_YES=1; shift ;;
+            *) die "unknown rollback option: $1" ;;
+        esac
+    done
+    if [[ -z "$to_tag" && -f "$STATE_DIR/last-update.json" ]]; then
+        to_tag="$(jq -r '.from_tag // empty' "$STATE_DIR/last-update.json")"
+        backup="${backup:-$(jq -r '.backup // empty' "$STATE_DIR/last-update.json")}"
+    fi
+    [[ -n "$to_tag" ]] || die "nothing recorded to roll back to (no .state/last-update.json) — pass --to <tag> or --backup <file>"
+    log_step "Rolling back → $to_tag"
+    confirm "Proceed with rollback to $to_tag?" || die "aborted."
+    update_apply "$to_tag" && log_ok "rolled back to $to_tag ($(panel_version))" \
+        || { [[ -n "$backup" ]] && cmd_restore "$backup" --yes; }
+}
+
+# --------------------------------------------------------------- lifecycle ---#
+require_installed() { [[ -f "$COMPOSE_FILE" && -f "$ENV_FILE" ]] || die "Zagros is not installed here (run: zagros install)."; }
+
+cmd_up()      { require_root; require_installed; compose up -d; wait_healthy "$SERVICE" 120 \
+                && log_ok "zagros up ($(panel_version))" || die "failed to become healthy — zagros logs"; }
+cmd_down()    { require_root; require_installed; compose down; log_ok "zagros down (containers removed, data kept)"; }
+cmd_start()   { require_root; require_installed; compose start; wait_healthy "$SERVICE" 120 \
+                && log_ok "started ($(panel_version))" || die "failed to start healthy — zagros logs"; }
+cmd_stop()    { require_root; require_installed; compose stop; log_ok "stopped"; }
+cmd_restart() { require_root; require_installed; compose restart; wait_healthy "$SERVICE" 120 \
+                && log_ok "restarted ($(panel_version))" || die "restart unhealthy — zagros logs"; }
+cmd_reload()  {
+    require_root; require_installed
+    log_step "Reload (recreate panel container)"
+    compose up -d --force-recreate "$SERVICE" >/dev/null
+    wait_healthy "$SERVICE" 150 && log_ok "reloaded ($(panel_version))" \
+        || die "reload unhealthy — zagros logs"
+}
+cmd_logs() {
+    require_installed
+    local args=(--tail=200) follow=1 svc=""
+    while (($#)); do
+        case "$1" in
+            --no-follow|-F) follow=0; shift ;;
+            --tail) args=(--tail="$2"); shift 2 ;;
+            --tail=*) args=(--tail="${1#*=}"); shift ;;
+            zagros|zagros-db) svc="$1"; shift ;;
+            *) svc="$1"; shift ;;
+        esac
+    done
+    (( follow )) && args+=(-f)
+    [[ -n "$svc" ]] || svc="$SERVICE"
+    compose logs "${args[@]}" "$svc"
+}
+cmd_shell()   { require_root; require_installed
+                panel_exec bash 2>/dev/null || panel_exec sh; }
+
+# ----------------------------------------------------------------- status ---#
+cmd_status() {
+    require_installed
+    log_step "Zagros status"
+    local tag version health_status
+    tag="$(env_get ZAGROS_IMAGE_TAG)"; version="$(panel_version)"
+    health_status="$(docker inspect --format '{{if .State.Health}}{{.State.Health.Status}}{{else}}container: {{.State.Status}}{{end}}' "$SERVICE" 2>/dev/null || echo "not running")"
+    printf '  %-22s %s\n' "panel version:" "$version"
+    printf '  %-22s %s\n' "image:" "$IMAGE_REPO:${tag:-unknown}"
+    printf '  %-22s %s\n' "health:" "$health_status"
+    printf '  %-22s %s\n' "database:" "$(env_get ZAGROS_DB_KIND)"
+    printf '  %-22s http://%s:%s\n' "panel:" "0.0.0.0" "$(env_get UVICORN_PORT)"
+    docker ps --filter "name=zagros" --format 'table {{.Names}}\t{{.Status}}\t{{.Image}}' | sed 's/^/  /'
+    if command -v jq >/dev/null 2>&1 && [[ "$health_status" == "healthy" ]]; then
+        local cores
+        if cores="$(hostctl cores-list --no-probe 2>/dev/null)"; then
+            printf '%s\n' "$cores" | jq -r '.cores[] | "  core \(.id): \(.state)\(if .enabled then " (enabled)" else " (disabled)" end)"' | sed 's/^/  /'
+        fi
+    fi
+}
+cmd_health() {
+    require_installed
+    local h
+    h="$(docker inspect --format '{{if .State.Health}}{{.State.Health.Status}}{{else}}{{.State.Status}}{{end}}' "$SERVICE" 2>/dev/null || echo missing)"
+    [[ "$h" == "healthy" || "$h" == "running" ]] || { log_err "container health: $h"; exit 1; }
+    local payload
+    payload="$(hostctl health 2>/dev/null)" || { log_err "panel internal health probe failed"; exit 1; }
+    if printf '%s' "$payload" | jq -e '.healthy == true' >/dev/null 2>&1; then
+        log_ok "healthy: db=$(printf '%s' "$payload" | jq -r '.db.driver') up-to-date=$(printf '%s' "$payload" | jq -r '.db.up_to_date') cores(running/enabled/installed)=$(printf '%s' "$payload" | jq -r '[.cores.running, .cores.enabled, .cores.installed] | join("/")')"
+    else
+        printf '%s\n' "$payload" | jq '.' >&2
+        die "panel reports UNHEALTHY"
+    fi
+}
+
+cmd_version() {
+    printf 'zagros CLI     %s\n' "$ZAGROS_CLI_VERSION"
+    if [[ -f "$ENV_FILE" ]]; then
+        printf 'image tag      %s\n' "$(env_get ZAGROS_IMAGE_TAG)"
+        if docker inspect "$SERVICE" >/dev/null 2>&1; then
+            printf 'panel version  %s\n' "$(panel_version)"
+        fi
+    fi
+    local latest
+    latest="$(resolve_version latest 2>/dev/null || true)"
+    if [[ -n "$latest" ]]; then
+        printf 'latest release %s\n' "$latest"
+    fi
+}
+
+# ----------------------------------------------------------------- backup ---#
+do_backup() {  # do_backup [--logs|--no-logs] → echoes archive path
+    local with_logs=0
+    [[ "${1:-}" == "--logs" ]] && with_logs=1
+    local ts staging archive db_kind platform_url legacy_url port
+    ts="$(date -u +%Y%m%d-%H%M%SZ)"
+    staging="$ZAGROS_DATA/backups/.staging-$ts"
+    archive="$BACKUP_DIR/zagros-backup-$ts.tar.gz"
+    mkdir -p "$staging/db" "$staging/config" "$staging/data"
+    db_kind="$(env_get ZAGROS_DB_KIND)"
+
+    # 1. databases
+    case "$db_kind" in
+        sqlite)
+            hostctl db-backup-sqlite --out "/var/lib/zagros/backups/.staging-$ts/db/zagros.sqlite3" >/dev/null \
+                || { rm -rf "$staging"; log_err "platform DB backup failed"; return 1; }
+            panel_exec python3 -m app.platform.hostctl db-backup-sqlite \
+                --url "$(env_get SQLALCHEMY_DATABASE_URL)" \
+                --out "/var/lib/zagros/backups/.staging-$ts/db/legacy.sqlite3" >/dev/null \
+                || log_warn "legacy DB backup failed (continuing — platform DB is safe)"
+            ;;
+        mysql|mariadb)
+            port="$(env_get ZAGROS_DB_PORT)"
+            local root_pw
+            root_pw="$(grep -oE 'MYSQL_ROOT_PASSWORD: .*' "$COMPOSE_FILE" | head -1 | cut -d' ' -f2-)"
+            docker exec -e MYSQL_PWD="$root_pw" "$DB_SERVICE" \
+                mysqldump -h127.0.0.1 --port="$port" -uroot --single-transaction --routines --triggers \
+                --databases zagros zagros_legacy > "$staging/db/databases.sql" \
+                || { rm -rf "$staging"; log_err "mysqldump failed"; return 1; }
+            ;;
+        postgresql)
+            port="$(env_get ZAGROS_DB_PORT)"
+            docker exec -e PGPASSWORD="$(env_get ZAGROS_DB_PASSWORD)" "$DB_SERVICE" \
+                pg_dump -h127.0.0.1 -p "$port" -U "$(env_get ZAGROS_DB_USER)" -Fc -d zagros \
+                > "$staging/db/zagros.pgdump" \
+                || { rm -rf "$staging"; log_err "pg_dump (zagros) failed"; return 1; }
+            docker exec -e PGPASSWORD="$(env_get ZAGROS_DB_PASSWORD)" "$DB_SERVICE" \
+                pg_dump -h127.0.0.1 -p "$port" -U "$(env_get ZAGROS_DB_USER)" -Fc -d zagros_legacy \
+                > "$staging/db/legacy.pgdump" \
+                || log_warn "pg_dump (zagros_legacy) failed (continuing)"
+            ;;
+    esac
+
+    # 2. configuration & runtime state
+    cp -a "$ENV_FILE" "$staging/config/zagros.env"
+    cp -a "$COMPOSE_FILE" "$staging/config/docker-compose.yml"
+    [[ -d "$STATE_DIR" ]] && cp -a "$STATE_DIR" "$staging/config/.state" || true
+
+    # 3. panel data: configs, certificates, keys, driver metadata, runtime
+    #    configs — excluding re-downloadable binaries/assets and (unless
+    #    --logs) log files. Every exclusion is recorded in the manifest.
+    (cd "$ZAGROS_DATA" && tar --exclude='./backups' \
+        --exclude='./cores/*/bin' --exclude='./db' \
+        --exclude='./logs' --exclude='./cores/*/assets' \
+        --exclude='./zagros.db' --exclude='./zagros.db-*' \
+        --exclude='./legacy.db' --exclude='./legacy.db-*' \
+        -czf "$staging/data/panel-data.tar.gz" .)
+    if (( with_logs )); then
+        [[ -d "$ZAGROS_DATA/logs" ]] && (cd "$ZAGROS_DATA" && tar -czf "$staging/data/logs.tar.gz" logs) || true
+        compose logs --no-color --tail=2000 > "$staging/data/panel.log" 2>/dev/null || true
+    fi
+
+    cat > "$staging/manifest.meta" <<EOF
+kind=zagros-full
+cli=$ZAGROS_CLI_VERSION
+panel=$(panel_version 2>/dev/null || echo unknown)
+image_tag=$(env_get ZAGROS_IMAGE_TAG)
+db_kind=$db_kind
+created_utc=$ts
+exclusions=cores/*/bin, cores/*/assets (self-installable), ./db (dumped separately), $( (( with_logs )) || echo "./logs," )./backups
+EOF
+    write_manifest "$staging"
+    tar -czf "$archive.tmp" -C "$staging" .
+    mv "$archive.tmp" "$archive"
+    chmod 600 "$archive"
+    rm -rf "$staging"
+    printf '%s\n' "$archive"
+}
+cmd_backup() {
+    local with_logs=0
+    [[ "${1:-}" == "--logs" ]] && with_logs=1
+    require_root; require_installed
+    log_step "Backup (database + configuration + certificates + driver metadata + keys$( (( with_logs )) && echo ' + logs'))"
+    local path
+    path="$(do_backup "$( (( with_logs )) && echo --logs || echo --no-logs)")" \
+        || die "backup failed"
+    local size
+    size="$(du -h "$path" | cut -f1)"
+    log_ok "backup written: $path ($size)"
+}
+cmd_backup_service() {
+    require_root
+    [[ -d "$ZAGROS_HOME" ]] || die "nothing installed at $ZAGROS_HOME"
+    local ts archive
+    ts="$(date -u +%Y%m%d-%H%M%SZ)"
+    archive="$BACKUP_DIR/zagros-service-$ts.tar.gz"
+    mkdir -p "$BACKUP_DIR"
+    local args=( -C "$(dirname "$ZAGROS_HOME")" "$(basename "$ZAGROS_HOME")" )
+    local with_cli=""
+    if [[ -x "$ZAGROS_BIN/zagros" && "$ZAGROS_BIN" != "$(dirname "$ZAGROS_HOME")" ]]; then
+        args+=( -C "$ZAGROS_BIN" zagros )
+        with_cli="yes"
+    fi
+    tar -czf "$archive.tmp" "${args[@]}"
+    mv "$archive.tmp" "$archive"; chmod 600 "$archive"
+    docker images "$IMAGE_REPO" --format '{{.Repository}}:{{.Tag}} {{.Digest}}' \
+        > "$BACKUP_DIR/zagros-service-$ts.images.txt" 2>/dev/null || true
+    log_ok "service/system backup: $archive (compose, env, CLI state${with_cli:+, CLI binary} + image pin list)"
+}
+
+# ---------------------------------------------------------------- restore ---#
+cmd_restore() {
+    local archive="" dry=0 yes=0
+    while (($#)); do
+        case "$1" in
+            --dry-run) dry=1; shift ;;
+            --yes|-y) yes=1; shift ;;
+            --*) die "unknown restore option: $1" ;;
+            *) archive="$1"; shift ;;
+        esac
+    done
+    require_root; require_installed
+    if [[ "$archive" == "latest" || -z "$archive" ]]; then
+        archive="$(ls -1t "$BACKUP_DIR"/zagros-backup-*.tar.gz 2>/dev/null | head -1 || true)"
+        [[ -n "$archive" ]] || die "no backups found in $BACKUP_DIR"
+    fi
+    [[ -f "$archive" ]] || die "backup not found: $archive"
+    log_step "Restore: $archive"
+
+    local staging
+    staging="$(mktemp -d /tmp/zagros-restore.XXXXXX)"
+    tar -tzf "$archive" >/dev/null 2>&1 || { rm -rf "$staging"; die "archive is not a readable tar.gz"; }
+    tar -xzf "$archive" -C "$staging"
+
+    # manifest verification
+    local db_kind cur_kind panel_v
+    db_kind="$(grep '^db_kind=' "$staging/manifest.meta" 2>/dev/null | cut -d= -f2-)"
+    panel_v="$(grep '^panel=' "$staging/manifest.meta" 2>/dev/null | cut -d= -f2- || true)"
+    cur_kind="$(env_get ZAGROS_DB_KIND)"
+    [[ -n "$db_kind" ]] || { rm -rf "$staging"; die "manifest missing — not a Zagros backup?"; }
+    if [[ "$db_kind" != "$cur_kind" ]]; then
+        die "database kind mismatch: backup=$db_kind, current=$cur_kind — restore requires the same engine (migrate manually instead)."
+    fi
+    log_info "backup panel version: ${panel_v:-unknown}; current image: $(env_get ZAGROS_IMAGE_TAG)"
+
+    # file integrity vs manifest (when present)
+    if [[ -f "$staging/manifest.json" ]]; then
+        local bad=0 rel sum
+        while IFS=$'\t' read -r rel sum; do
+            [[ -f "$staging/$rel" ]] || { log_err "missing in archive: $rel"; bad=1; continue; }
+            [[ "$(sha256sum "$staging/$rel" | awk '{print $1}')" == "$sum" ]] || { log_err "checksum mismatch: $rel"; bad=1; }
+        done < <(jq -r '.files[] | [.path, .sha256] | @tsv' "$staging/manifest.json" 2>/dev/null)
+        (( bad == 0 )) || { rm -rf "$staging"; die "backup integrity check FAILED"; }
+        log_ok "integrity verified vs manifest"
+    fi
+
+    # plan
+    cat <<EOF
+Restore plan:
+  1. safety snapshot of the current state
+  2. stop services
+  3. restore database ($db_kind)
+  4. restore configuration & data (certs, keys, core metadata, runtime config)
+  5. start services, verify health + schema
+  6. auto-rollback to the safety snapshot on failure
+EOF
+    if (( dry )); then log_ok "dry-run OK — no changes made"; rm -rf "$staging"; return 0; fi
+    confirm "Proceed with restore?" || { rm -rf "$staging"; die "aborted."; }
+
+    # 1. safety snapshot
+    local safety
+    safety="$(do_backup --no-logs 2>/dev/null || true)"
+    [[ -n "$safety" ]] && log_info "safety snapshot: $safety"
+
+    if restore_apply "$staging" "$db_kind"; then
+        log_ok "restore complete ($(panel_version))"
+        rm -rf "$staging"
+    else
+        log_err "restore FAILED"
+        if [[ -n "$safety" && -f "$safety" ]]; then
+            local s2
+            s2="$(mktemp -d /tmp/zagros-rollback.XXXXXX)"
+            tar -xzf "$safety" -C "$s2" 2>/dev/null \
+                && restore_apply "$s2" "$cur_kind" \
+                && log_warn "rolled back to the pre-restore snapshot" \
+                || log_err "auto-rollback failed — manual intervention required"
+            rm -rf "$s2"
+        fi
+        rm -rf "$staging"
+        die "restore failed (see messages above)"
+    fi
+}
+
+restore_apply() {  # restore_apply <staging> <db_kind> → 0/1
+    local staging="$1" db_kind="$2" port
+    compose stop >/dev/null 2>&1 || true
+
+    cp -a "$staging/config/zagros.env" "$ENV_FILE" || return 1
+    cp -a "$staging/config/docker-compose.yml" "$COMPOSE_FILE" || true
+    [[ -d "$staging/config/.state" ]] && { rm -rf "$STATE_DIR"; cp -a "$staging/config/.state" "$STATE_DIR"; } || true
+
+    if [[ -f "$staging/data/panel-data.tar.gz" ]]; then
+        tar -xzf "$staging/data/panel-data.tar.gz" -C "$ZAGROS_DATA" || { log_err "data unpack failed"; return 1; }
+    fi
+    [[ -f "$staging/data/logs.tar.gz" ]] && tar -xzf "$staging/data/logs.tar.gz" -C "$ZAGROS_DATA" || true
+
+    case "$db_kind" in
+        sqlite)
+            cp -a "$staging/db/zagros.sqlite3" "$ZAGROS_DATA/zagros.db" || return 1
+            rm -f "$ZAGROS_DATA/zagros.db-wal" "$ZAGROS_DATA/zagros.db-shm"
+            [[ -f "$staging/db/legacy.sqlite3" ]] && { cp -a "$staging/db/legacy.sqlite3" "$ZAGROS_DATA/legacy.db"; rm -f "$ZAGROS_DATA/legacy.db-"*; } || true
+            ;;
+        mysql|mariadb)
+            compose up -d "$DB_SERVICE" >/dev/null 2>&1 || true
+            wait_healthy "$DB_SERVICE" 150 || { log_err "db service not healthy"; return 1; }
+            port="$(env_get ZAGROS_DB_PORT)"
+            local root_pw
+            root_pw="$(grep -oE 'MYSQL_ROOT_PASSWORD: .*' "$COMPOSE_FILE" | head -1 | cut -d' ' -f2-)"
+            provision_legacy_db
+            docker exec -i -e MYSQL_PWD="$root_pw" "$DB_SERVICE" \
+                mysql -h127.0.0.1 --port="$port" -uroot < "$staging/db/databases.sql" || return 1
+            ;;
+        postgresql)
+            compose up -d "$DB_SERVICE" >/dev/null 2>&1 || true
+            wait_healthy "$DB_SERVICE" 150 || { log_err "db service not healthy"; return 1; }
+            port="$(env_get ZAGROS_DB_PORT)"
+            provision_legacy_db
+            docker exec -i -e PGPASSWORD="$(env_get ZAGROS_DB_PASSWORD)" "$DB_SERVICE" \
+                pg_restore -h127.0.0.1 -p "$port" -U "$(env_get ZAGROS_DB_USER)" -d zagros \
+                --clean --if-exists < "$staging/db/zagros.pgdump" || return 1
+            [[ -f "$staging/db/legacy.pgdump" ]] && \
+            docker exec -i -e PGPASSWORD="$(env_get ZAGROS_DB_PASSWORD)" "$DB_SERVICE" \
+                pg_restore -h127.0.0.1 -p "$port" -U "$(env_get ZAGROS_DB_USER)" -d zagros_legacy \
+                --clean --if-exists < "$staging/db/legacy.pgdump" || true
+            ;;
+    esac
+
+    compose up -d >/dev/null 2>&1 || true
+    wait_healthy "$SERVICE" 200 || { log_err "panel unhealthy after restore"; return 1; }
+    panel_exec python3 -m alembic upgrade head >/dev/null 2>&1 || log_warn "post-restore migration reported issues (check: zagros migrate)"
+    hostctl db-check 2>/dev/null | jq -e '.reachable == true' >/dev/null 2>&1 \
+        || { log_err "database not reachable after restore"; return 1; }
+    return 0
+}
+
+# ---------------------------------------------------------------- migrate ---#
+cmd_migrate() {
+    require_root; require_installed
+    log_step "alembic upgrade head"
+    panel_exec python3 -m alembic upgrade head
+    panel_exec python3 -m alembic current
+    cmd_health >/dev/null && log_ok "migration complete & healthy" || die "migration ran but health check failed — zagros doctor"
+}
+
+# ----------------------------------------------------------------- doctor ---#
+_DOCTOR_REPORT=""
+_DOCTOR_JSON=0
+dr() {  # dr <status> <check> <detail> — record + print
+    local status="$1" check="$2" detail="$3"
+    if (( _DOCTOR_JSON )); then
+        # machine-readable mode: human lines go to stderr, stdout is pure JSON
+        printf '[doctor] %s %s — %s\n' "$status" "$check" "$detail" >&2
+    else
+        case "$status" in
+            OK)   log_ok   "$check — $detail" ;;
+            WARN) log_warn "$check — $detail" ;;
+            FAIL) log_err  "$check — $detail" ;;
+        esac
+    fi
+    printf '%s\t%s\t%s\n' "$check" "$status" "$detail" >> "$_DOCTOR_REPORT"
+}
+dr_kv() { printf '%s\t%s\t%s\n' "$1" "INFO" "$2" >> "$_DOCTOR_REPORT"; }
+
+cmd_doctor() {
+    require_installed
+    local json=0
+    [[ "${1:-}" == "--json" ]] && json=1
+    ensure_cmd jq jq
+    (( json )) && _DOCTOR_JSON=1 || _DOCTOR_JSON=0
+    _DOCTOR_REPORT="$(mktemp)"
+    (( json )) || log_step "Zagros doctor"
+
+    # --- host system
+    dr_kv "kernel" "$(uname -srmo 2>/dev/null)"
+    local disk_pct diskp mem
+    disk_pct="$(df -P "$ZAGROS_DATA" | awk 'NR==2{gsub(/%/,"",$5); print $5}')"
+    diskp="$(df -h "$ZAGROS_DATA" | awk 'NR==2{printf "%s/%s (%s free)", $3, $2, $4}')"
+    if   (( disk_pct >= 90 )); then dr FAIL "disk" "$diskp"
+    elif (( disk_pct >= 80 )); then dr WARN "disk" "$diskp"
+    else dr OK "disk" "$diskp"; fi
+    mem="$(free -m | awk '/^Mem:/{printf "%d/%d MB", $3, $2}')"
+    local mem_pct
+    mem_pct="$(free -m | awk '/^Mem:/{printf "%d", $3*100/$2}')"
+    if   (( mem_pct >= 92 )); then dr FAIL "memory" "$mem"
+    elif (( mem_pct >= 85 )); then dr WARN "memory" "$mem"
+    else dr OK "memory" "$mem"; fi
+    local load ncpu
+    load="$(cut -d' ' -f1 /proc/loadavg)"; ncpu="$(nproc)"
+    awk -v l="$load" -v n="$ncpu" 'BEGIN{exit !(l > n*2)}' && dr WARN "cpu" "load1=$load on $ncpu cores" || dr OK "cpu" "load1=$load on $ncpu cores"
+
+    # --- docker
+    if command -v docker >/dev/null 2>&1; then
+        if docker info >/dev/null 2>&1; then dr OK "docker daemon" "$(docker --version | head -1)"
+        else dr FAIL "docker daemon" "installed but not reachable (systemctl status docker)"; fi
+        compose_probe 2>/dev/null && dr OK "compose" "$("${COMPOSE[@]}" version 2>/dev/null | head -1)" || dr FAIL "compose" "compose plugin missing"
+    else
+        dr FAIL "docker" "not installed"
+    fi
+
+    # --- image & registry
+    local tag local_dgh remote_dgh
+    tag="$(env_get ZAGROS_IMAGE_TAG)"
+    if docker image inspect "$IMAGE_REPO:$tag" >/dev/null 2>&1; then
+        dr OK "image" "$IMAGE_REPO:$tag present"
+        local_dgh="$(local_image_digest "$tag" || true)"
+        if remote_dgh="$(ghcr_remote_digest "$tag" 2>/dev/null)"; then
+            if [[ -n "$local_dgh" && "$local_dgh" == "$remote_dgh" ]]; then
+                dr OK "ghcr digest" "local == remote ($remote_dgh)"
+            else
+                dr WARN "ghcr digest" "differs (local=${local_dgh:-?} remote=$remote_dgh) — zagros update --force"
+            fi
+        else
+            dr WARN "ghcr" "registry not reachable (auth/network?)"
+        fi
+    else
+        dr FAIL "image" "$IMAGE_REPO:$tag not pulled — zagros repair or update"
+    fi
+
+    # --- version currency
+    local latest_rel
+    if latest_rel="$(resolve_version latest 2>/dev/null)"; then
+        if [[ "$latest_rel" == "$tag" ]]; then dr OK "release currency" "$tag is the newest release"
+        else dr WARN "release currency" "installed=$tag newest=$latest_rel — zagros update"; fi
+    else
+        dr WARN "github releases" "api.github.com unreachable — cannot check for updates"
+    fi
+
+    # --- containers
+    local h
+    h="$(docker inspect --format '{{if .State.Health}}{{.State.Health.Status}}{{else}}{{.State.Status}}{{end}}' "$SERVICE" 2>/dev/null || echo missing)"
+    [[ "$h" == "healthy" || "$h" == "running" ]] && dr OK "container zagros" "$h" || dr FAIL "container zagros" "$h"
+    if [[ "$(env_get ZAGROS_DB_KIND)" != "sqlite" ]]; then
+        h="$(docker inspect --format '{{if .State.Health}}{{.State.Health.Status}}{{else}}{{.State.Status}}{{end}}' "$DB_SERVICE" 2>/dev/null || echo missing)"
+        [[ "$h" == "healthy" || "$h" == "running" ]] && dr OK "container zagros-db" "$h" || dr FAIL "container zagros-db" "$h"
+    fi
+
+    # --- env sanity
+    local secret dburl
+    secret="$(env_get ZAGROS_SECRET_KEY)"
+    ((${#secret} >= 32)) && dr OK "ZAGROS_SECRET_KEY" "set (${#secret} chars)" \
+        || dr FAIL "ZAGROS_SECRET_KEY" "missing/too short in $ENV_FILE"
+    dburl="$(env_get ZAGROS_DATABASE_URL)"
+    [[ -n "$dburl" ]] && dr OK "ZAGROS_DATABASE_URL" "${dburl%%://*}://…" || dr FAIL "ZAGROS_DATABASE_URL" "missing"
+
+    # --- database + migration + panel internals
+    local dbc
+    if dbc="$(hostctl db-check 2>/dev/null)"; then
+        if printf '%s' "$dbc" | jq -e '.up_to_date == true' >/dev/null 2>&1; then
+            dr OK "database + schema" "$(printf '%s' "$dbc" | jq -r '.driver') @ $(printf '%s' "$dbc" | jq -r '.alembic_heads[0]')"
+        else
+            dr FAIL "database + schema" "$(printf '%s' "$dbc" | jq -r 'if .alembic_error then .alembic_error else "pending migration" end' 2>/dev/null || printf '%s' "$dbc" | head -c 200) — zagros migrate"
+        fi
+    else
+        dr FAIL "database" "panel db-check failed (container healthy?)"
+    fi
+
+    # --- cores
+    local cores fail_cores=0
+    if cores="$(hostctl cores-list 2>/dev/null)"; then
+        while IFS= read -r line; do
+            local cid cstate chealth
+            cid="$(printf '%s' "$line" | jq -r '.id')"
+            cstate="$(printf '%s' "$line" | jq -r '.state')"
+            chealth="$(printf '%s' "$line" | jq -r '.health // "n/a"')"
+            if [[ "$cstate" == "running" && ( "$chealth" == "healthy" || "$chealth" == "n/a" ) ]]; then
+                dr OK "core $cid" "$cstate/$chealth $(printf '%s' "$line" | jq -r '.core_version // ""')"
+            elif [[ "$cstate" == "running" ]]; then
+                dr WARN "core $cid" "$cstate/$chealth"; fail_cores=$((fail_cores+1))
+            else
+                dr OK "core $cid" "$cstate (not running)"
+            fi
+        done < <(printf '%s' "$cores" | jq -c '.cores[]')
+        ((${#cores} == 0 || $(printf '%s' "$cores" | jq '.cores | length') == 0)) && \
+            dr OK "cores" "none installed yet (zagros list-cores / install-core)"
+    else
+        dr WARN "cores" "inventory unavailable right now"
+    fi
+
+    # --- nodes (platform node states)
+    local nodes_payload nodes_n nodes_up
+    if nodes_payload="$(hostctl nodes-list 2>/dev/null)"; then
+        nodes_n="$(printf '%s' "$nodes_payload" | jq '.nodes | length')"
+        nodes_up="$(printf '%s' "$nodes_payload" | jq -r '[.nodes[] | select(.status == "connected")] | length')"
+        if (( nodes_n == 0 )); then dr OK "nodes" "none configured"
+        elif [[ "$nodes_up" == "$nodes_n" ]]; then dr OK "nodes" "$nodes_n/$nodes_n connected"
+        else dr WARN "nodes" "$nodes_up/$nodes_n connected"; fi
+    else
+        dr WARN "nodes" "node inventory unavailable"
+    fi
+
+    # --- certificates in data tree
+    local certs_expiring=0 cert
+    while IFS= read -r -d '' cert; do
+        local end days
+        end="$(openssl x509 -enddate -noout -in "$cert" 2>/dev/null | cut -d= -f2-)" || continue
+        days=$(( ( $(date -d "$end" +%s 2>/dev/null || date +%s) - $(date +%s) ) / 86400 ))
+        (( days >= 0 && days <= 14 )) && { dr WARN "certificate" "$cert expires in ${days}d ($end)"; certs_expiring=$((certs_expiring+1)); }
+    done < <(find "$ZAGROS_DATA" -maxdepth 4 -type f \( -name '*.crt' -o -name '*.pem' \) -print0 2>/dev/null | head -z -n 50)
+    (( certs_expiring == 0 )) && dr OK "certificates" "no near-expiry certs found (≤14d window)"
+
+    # --- network / dns / firewall / ports
+    local port
+    port="$(env_get UVICORN_PORT)"; port="${port:-8000}"
+    if timeout 3 bash -c "</dev/tcp/127.0.0.1/$port" 2>/dev/null; then dr OK "panel port" "$port/tcp accepting"
+    else dr FAIL "panel port" "nothing listening on 127.0.0.1:$port"; fi
+    local dnsok=1
+    for host in ghcr.io api.github.com raw.githubusercontent.com; do
+        getent hosts "$host" >/dev/null 2>&1 || { dr FAIL "dns" "cannot resolve $host"; dnsok=0; }
+    done
+    (( dnsok == 1 )) && dr OK "dns" "ghcr.io / api.github.com resolvable"
+    if timeout 8 curl -fsSI -o /dev/null https://ghcr.io/v2/ 2>/dev/null; then dr OK "network egress" "HTTPS to ghcr.io works"; else dr WARN "network egress" "cannot reach ghcr.io/v2 (proxy/firewall?)"; fi
+    local fw="none detected"
+    if command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -q "Status: active"; then fw="ufw active"
+    elif command -v firewall-cmd >/dev/null 2>&1 && firewall-cmd --state >/dev/null 2>&1; then fw="firewalld active"
+    elif command -v nft >/dev/null 2>&1 && nft list ruleset 2>/dev/null | grep -q .; then fw="nftables rules present"
+    elif command -v iptables >/dev/null 2>&1 && iptables -S 2>/dev/null | grep -qv '^-P\|^$'; then fw="iptables rules present"
+    fi
+    dr_kv "firewall" "$fw"
+    [[ "$fw" == "none detected" ]] || dr WARN "firewall" "$fw — verify port $port (+ core ports) are allowed; host firewalling is site-specific"
+
+    # --- summary
+    local fails warns
+    fails="$(grep -c '	FAIL' "$_DOCTOR_REPORT" || true)"
+    warns="$(grep -c '	WARN' "$_DOCTOR_REPORT" || true)"
+    if (( json )); then
+        printf '[doctor] summary: %s failed, %s warnings\n' "$fails" "$warns" >&2
+    else
+        echo
+        log_step "Doctor summary: $fails failed, $warns warnings"
+    fi
+    if (( json )); then
+        jq -R '[inputs | split("\t") | select(length == 3) | {check: .[0], status: .[1], detail: .[2]}]' \
+            < "$_DOCTOR_REPORT"
+    fi
+    rm -f "$_DOCTOR_REPORT"
+    (( fails == 0 ))
+}
+
+# ----------------------------------------------------------------- repair ---#
+cmd_repair() {
+    require_root; require_installed
+    log_step "Zagros repair — safe automatic fixes"
+    local changed=0
+
+    if ! docker info >/dev/null 2>&1; then
+        if command -v systemctl >/dev/null 2>&1; then
+            systemctl start docker && dr_log "started docker daemon" && changed=1
+        fi
+        docker info >/dev/null 2>&1 || die "docker daemon is not running and could not be started"
+    fi
+    compose_probe
+
+    mkdir -p "$ZAGROS_HOME" "$STATE_DIR" "$ZAGROS_DATA" "$BACKUP_DIR" \
+             "$ZAGROS_DATA/cores" "$ZAGROS_DATA/logs"
+    chmod 700 "$ZAGROS_HOME" "$STATE_DIR"
+
+    [[ -f "$ENV_FILE" ]] || die "$ENV_FILE missing — repair cannot invent configuration; reinstall (zagros install) after removing $(dirname "$ENV_FILE")."
+    chmod 600 "$ENV_FILE"
+
+    if ! grep -qE '^ZAGROS_SECRET_KEY=.+' "$ENV_FILE"; then
+        if [[ -n "$(find "$ZAGROS_DATA" -maxdepth 1 -name 'zagros.db' -print -quit 2>/dev/null)" ]]; then
+            log_warn "ZAGROS_SECRET_KEY missing but a database exists — NOT inventing a new key (encrypted data would become unreadable). Restore the key from a backup, or wipe and reinstall."
+        else
+            env_set ZAGROS_SECRET_KEY "$(gen_secret 32)"; log_ok "generated missing ZAGROS_SECRET_KEY (fresh install)"; changed=1
+        fi
+    fi
+    for k in ZAGROS_DB_KIND UVICORN_PORT ZAGROS_IMAGE_TAG; do
+        if ! grep -qE "^$k=.+" "$ENV_FILE"; then
+            case "$k" in
+                ZAGROS_DB_KIND)   env_set "$k" sqlite ;;
+                UVICORN_PORT)     env_set "$k" 8000 ;;
+                ZAGROS_IMAGE_TAG) env_set "$k" "$(resolve_version latest)" ;;
+            esac
+            log_ok "repaired missing key $k"; changed=1
+        fi
+    done
+
+    if ! docker image inspect "$IMAGE_REPO:$(env_get ZAGROS_IMAGE_TAG)" >/dev/null 2>&1; then
+        log_info "image missing — pulling $IMAGE_REPO:$(env_get ZAGROS_IMAGE_TAG)"
+        compose pull && changed=1
+    fi
+
+    local h
+    h="$(docker inspect --format '{{if .State.Health}}{{.State.Health.Status}}{{else}}{{.State.Status}}{{end}}' "$SERVICE" 2>/dev/null || echo missing)"
+    if [[ "$h" != "healthy" && "$h" != "running" ]]; then
+        log_info "container not healthy ($h) — recreating"
+        compose up -d --force-recreate "$SERVICE" >/dev/null && changed=1
+    fi
+    if [[ "$(env_get ZAGROS_DB_KIND)" != "sqlite" ]]; then
+        h="$(docker inspect --format '{{if .State.Health}}{{.State.Health.Status}}{{else}}{{.State.Status}}{{end}}' "$DB_SERVICE" 2>/dev/null || echo missing)"
+        if [[ "$h" != "healthy" && "$h" != "running" ]]; then
+            compose up -d "$DB_SERVICE" >/dev/null && changed=1
+            wait_healthy "$DB_SERVICE" 150 && provision_legacy_db && changed=1
+        fi
+    fi
+
+    log_step "schema verification"
+    panel_exec python3 -m alembic upgrade head >/dev/null \
+        && log_ok "schema at head" \
+        || log_warn "migration had issues — check zagros migrate output"
+
+    [[ -x "$ZAGROS_BIN/zagros" ]] || { install_cli_file; changed=1; }
+
+    if (( changed == 0 )); then log_ok "nothing needed repair — system looks consistent"
+    else log_ok "repair finished" ; fi
+    cmd_health || true
+}
+dr_log() { printf '%s\n' "$*"; }
+
+# ----------------------------------------------------------------- config ---#
+cmd_config() {
+    require_installed
+    local action="${1:-list}"; shift || true
+    case "$action" in
+        path) printf '%s\n' "$ENV_FILE" ;;
+        list)
+            while IFS= read -r line; do
+                [[ "$line" =~ ^#|^$ ]] && continue
+                local key="${line%%=*}" val="${line#*=}"
+                if [[ "$key" =~ SECRET|PASSWORD|KEY|TOKEN ]] && [[ "$key" != "ZAGROS_DB_KIND" ]]; then
+                    printf '%s=%s\n' "$key" "$(mask_secret "$val")"
+                else
+                    printf '%s\n' "$line"
+                fi
+            done < "$ENV_FILE"
+            ;;
+        get)
+            [[ -n "${1:-}" ]] || die "usage: zagros config get KEY"
+            env_get "$1" ;;
+        set)
+            require_root
+            [[ $# -ge 2 ]] || die "usage: zagros config set KEY VALUE [--force] [--restart]"
+            local key="$1" value="$2" force=0 restart=0
+            shift 2
+            while (($#)); do case "$1" in --force) force=1; shift ;; --restart) restart=1; shift ;; *) shift ;; esac; done
+            if [[ "$key" == "ZAGROS_SECRET_KEY" && -f "$ZAGROS_DATA/zagros.db" && "$force" == "0" ]]; then
+                die "refusing to rotate ZAGROS_SECRET_KEY while a database exists (it decrypts stored credentials). Re-check with --force only if you know the consequences."
+            fi
+            env_set "$key" "$value"
+            log_ok "$key set"
+            if (( restart )) || confirm "Restart panel to apply?"; then cmd_restart; fi
+            ;;
+        edit)
+            require_root
+            ${EDITOR:-vi} "$ENV_FILE"
+            confirm "Restart panel to apply changes?" && cmd_restart || true
+            ;;
+        validate)
+            local fails=0 secret port
+            secret="$(env_get ZAGROS_SECRET_KEY)"
+            ((${#secret} >= 16)) || { log_err "ZAGROS_SECRET_KEY < 16 chars"; fails=1; }
+            port="$(env_get UVICORN_PORT)"
+            [[ "$port" =~ ^[0-9]+$ && "$port" -ge 1 && "$port" -le 65535 ]] || { log_err "UVICORN_PORT invalid: $port"; fails=1; }
+            [[ -n "$(env_get ZAGROS_DATABASE_URL)" ]] || { log_err "ZAGROS_DATABASE_URL missing"; fails=1; }
+            [[ -n "$(env_get SQLALCHEMY_DATABASE_URL)" ]] || { log_err "SQLALCHEMY_DATABASE_URL missing"; fails=1; }
+            if grep -qE '^SQLALCHEMY_DATABASE_URL=sqlite' "$ENV_FILE" && grep -qE '^ZAGROS_DATABASE_URL=sqlite' "$ENV_FILE"; then
+                if [[ "$(env_get SQLALCHEMY_DATABASE_URL)" == "$(env_get ZAGROS_DATABASE_URL)" ]]; then
+                    log_err "P3 and legacy SQLite URLs point to the SAME file (schema collision) — they must differ"; fails=1
+                fi
+            fi
+            (( fails == 0 )) && log_ok "configuration valid" || die "configuration invalid"
+            ;;
+        *) die "usage: zagros config [list|get|set|edit|validate|path]" ;;
+    esac
+}
+
+# ------------------------------------------------------------------ admin ---#
+cmd_create_admin() {
+    require_root; require_installed
+    local username="" password="" sudo_flag=""
+    while (($#)); do
+        case "$1" in
+            --username) username="$2"; shift 2 ;;
+            --username=*) username="${1#*=}"; shift ;;
+            --password) password="$2"; shift 2 ;;
+            --password=*) password="${1#*=}"; shift ;;
+            --sudo) sudo_flag="--sudo"; shift ;;
+            --no-sudo) sudo_flag=""; shift ;;
+            *) die "unknown option: $1" ;;
+        esac
+    done
+    [[ -n "$username" ]] || { read -r -p "admin username: " username; }
+    [[ -n "$username" ]] || die "username required"
+    local printed_pw=""
+    if [[ -z "$password" ]]; then
+        password="$(gen_secret 12)"; printed_pw=1
+    fi
+    hostctl_json admin-create --username "$username" --password "$password" $sudo_flag \
+        | jq -r '"created admin: \(.username) (sudo=\(.is_sudo))"'
+    if (( printed_pw )); then
+        printf '%sgenerated password (shown once, store it safely):%s %s\n' "$C_YEL" "$C_RST" "$password"
+    fi
+}
+cmd_reset_admin() {
+    require_root; require_installed
+    local username="" password=""
+    while (($#)); do
+        case "$1" in
+            --username) username="$2"; shift 2 ;;
+            --username=*) username="${1#*=}"; shift ;;
+            --password) password="$2"; shift 2 ;;
+            --password=*) password="${1#*=}"; shift ;;
+            *) die "unknown option: $1" ;;
+        esac
+    done
+    [[ -n "$username" ]] || { read -r -p "admin username: " username; }
+    [[ -n "$username" ]] || die "username required"
+    local printed_pw=""
+    [[ -n "$password" ]] || { password="$(gen_secret 12)"; printed_pw=1; }
+    hostctl_json admin-reset --username "$username" --password "$password" \
+        | jq -r '"password reset for: \(.username)"'
+    if (( printed_pw )); then
+        printf '%sgenerated new password (shown once):%s %s\n' "$C_YEL" "$C_RST" "$password"
+    fi
+}
+
+# ------------------------------------------------------------------ cores ---#
+ZAGROS_KNOWN_CORES="xray sing-box hysteria2 tuic wireguard openvpn ssh softether"
+
+cmd_list_cores() {
+    require_installed
+    local json=0
+    [[ "${1:-}" == "--json" ]] && json=1
+    local payload
+    payload="$(hostctl cores-list 2>/dev/null)" || die "core inventory unavailable (panel running?)"
+    (( json )) && { printf '%s\n' "$payload" | jq '.'; return 0; }
+    local n
+    n="$(printf '%s' "$payload" | jq '.cores | length')"
+    if (( n == 0 )); then
+        log_info "no cores installed. Install one with: zagros install-core <core>"
+        printf '%s\n' "$payload" | jq -r '.stored_without_driver[]? | "  warn: stored core without driver: \(.)"'
+        return 0
+    fi
+    printf '%s%-12s %-10s %-9s %-9s %-14s %s%s\n' "$C_BLD" CORE STATE ENABLED HEALTH VERSION CAPABILITIES "$C_RST"
+    printf '%s\n' "$payload" | jq -r '.cores[] |
+        [.id, .state, (if .enabled then "yes" else "no" end), (.health // "-"),
+         (.core_version // "-"), ((.capabilities | join(","))[0:60])] | @tsv' \
+    | while IFS=$'\t' read -r id st en he ver caps; do
+        printf '%-12s %-10s %-9s %-9s %-14s %s\n' "$id" "$st" "$en" "$he" "$ver" "$caps"
+      done
+}
+
+_core_exists_check() {
+    [[ " $ZAGROS_KNOWN_CORES " == *" $1 "* ]] \
+        || log_warn "'$1' is not a known built-in core (known: $ZAGROS_KNOWN_CORES) — the panel registry will reject unknown ids"
+}
+
+_maybe_restart_after_core_op() {  # core op may need a panel reload to take effect
+    local restart_required="$1"
+    if [[ "$restart_required" == "true" ]]; then
+        log_step "applying via panel reload (core was running)"
+        compose up -d --force-recreate "$SERVICE" >/dev/null
+        wait_healthy "$SERVICE" 150 || die "panel did not come back healthy after reload"
+    fi
+}
+
+cmd_install_core() {
+    require_root; require_installed
+    local core="" settings="" disabled="" start_flag=1
+    while (($#)); do
+        case "$1" in
+            --settings) settings="$2"; shift 2 ;;
+            --settings=*) settings="${1#*=}"; shift ;;
+            --disabled) disabled="--disabled"; start_flag=0; shift ;;
+            --no-start) start_flag=0; shift ;;
+            --*) die "unknown option: $1" ;;
+            *) core="$1"; shift ;;
+        esac
+    done
+    [[ -n "$core" ]] || die "usage: zagros install-core <core> [--settings JSON] [--disabled]"
+    _core_exists_check "$core"
+    log_step "Installing core '$core' (SELF_INSTALL — official upstream binary)"
+    local args=(cores-install "$core")
+    [[ -n "$settings" ]] && args+=(--settings "$settings")
+    [[ -n "$disabled" ]] && args+=("$disabled")
+    hostctl_json "${args[@]}" | jq -r '"core \(.core): \(.state) (enabled=\(.enabled))"'
+    if (( start_flag )); then
+        log_step "Reloading panel to boot the new core"
+        compose restart "$SERVICE" >/dev/null
+        if wait_healthy "$SERVICE" 150; then
+            log_ok "core installed + panel reloaded"
+        else
+            log_warn "panel slow to reload — check zagros logs; core stays installed"
+        fi
+    fi
+}
+
+cmd_uninstall_core() {
+    require_root; require_installed
+    local core="" purge="" force=""
+    while (($#)); do
+        case "$1" in
+            --purge) purge="--purge"; shift ;;
+            --force) force="--force"; shift ;;
+            --*) die "unknown option: $1" ;;
+            *) core="$1"; shift ;;
+        esac
+    done
+    [[ -n "$core" ]] || die "usage: zagros uninstall-core <core> [--purge] [--force]"
+    local out rc restart_required
+    set +e
+    out="$(hostctl cores-uninstall "$core" $purge $force 2>/dev/null)"; rc=$?
+    set -e
+    case "$rc" in
+        0)
+            restart_required="$(printf '%s' "$out" | jq -r '.restart_required // false')"
+            printf '%s\n' "$out" | jq -r '"core \(.core) uninstalled (purged=\(.purged))"'
+            _maybe_restart_after_core_op "$restart_required"
+            ;;
+        3)
+            log_warn "core is running under the panel; dependency check passed — forcing with restart"
+            cmd_uninstall_core "$core" $purge --force
+            ;;
+        *)
+            printf '%s\n' "$out" | jq -r '"uninstall failed: \(.error) [code: \(.code // "n/a")]"' >&2 || printf '%s\n' "$out" >&2
+            die "uninstall-core failed (dependents? retry with --force)"
+            ;;
+    esac
+}
+
+cmd_update_core() {
+    require_root; require_installed
+    local core="" version=""
+    while (($#)); do
+        case "$1" in
+            --version) version="$2"; shift 2 ;;
+            --version=*) version="${1#*=}"; shift ;;
+            --*) die "unknown option: $1" ;;
+            *) core="$1"; shift ;;
+        esac
+    done
+    [[ -n "$core" ]] || die "usage: zagros update-core <core> [--version X]"
+    log_step "Updating core '$core' binary"
+    local args=(cores-update "$core") out restart_required
+    [[ -n "$version" ]] && args+=(--version "$version")
+    out="$(hostctl_json "${args[@]}")" || die "core update failed"
+    printf '%s\n' "$out" | jq -r '"core \(.core) → \(.version)"'
+    restart_required="$(printf '%s' "$out" | jq -r '.restart_required // false')"
+    _maybe_restart_after_core_op "$restart_required"
+    if [[ "$restart_required" == "false" ]]; then
+        log_ok "binary updated (core not running — starts with new version)"
+    fi
+}
+
+cmd_reload_core() {
+    require_root; require_installed
+    local core="$1"; shift || true
+    [[ -n "$core" ]] || die "usage: zagros reload-core <core>"
+    local out rc
+    set +e
+    out="$(hostctl cores-restart "$core" 2>/dev/null)"; rc=$?
+    set -e
+    case "$rc" in
+        0) printf '%s\n' "$out" | jq -r '"core \(.core) restarted (\(.state))"' ;;
+        3)
+            log_step "core runs under the live panel — reloading the service (alpha channel)"
+            compose restart "$SERVICE" >/dev/null
+            wait_healthy "$SERVICE" 150 \
+                && log_ok "panel reloaded; core '$core' restarted with it" \
+                || die "panel slow after reload — zagros logs"
+            ;;
+        4) die "core '$core' is not installed" ;;
+        *) printf '%s\n' "$out" >&2; die "reload-core failed" ;;
+    esac
+}
+
+cmd_sync() {
+    require_root; require_installed
+    local args=(sync)
+    [[ -n "${1:-}" ]] && args+=(--core "$1")
+    log_step "Sync: re-applying stored accounts to all enabled cores"
+    hostctl_json "${args[@]}" | jq -r '.cores | to_entries[] |
+        if .value.error then "  \(.key): ERROR — \(.value.error)"
+        elif .value.skipped then "  \(.key): skipped (\(.value.skipped))"
+        else "  \(.key): synced \(.value.synced) account(s)" end'
+    log_ok "sync finished"
+}
+
+# ------------------------------------------------------------- clean/prune ---#
+cmd_clean() {
+    require_root
+    local keep=7
+    while (($#)); do case "$1" in --keep) keep="$2"; shift 2 ;; --keep=*) keep="${1#*=}"; shift ;; *) die "unknown option: $1" ;; esac; done
+    [[ -d "$BACKUP_DIR" ]] || { log_info "no backups directory"; return 0; }
+    log_step "Clean: keep last $keep backups"
+    local removed=0 freed=0 f
+    for f in $(ls -1t "$BACKUP_DIR"/zagros-backup-*.tar.gz 2>/dev/null | tail -n +$((keep+1))); do
+        freed=$(( freed + $(stat -c %s "$f") ))
+        rm -f "$f" "$f.sha256"; removed=$((removed+1))
+    done
+    rm -rf "$ZAGROS_DATA"/backups/.staging-* 2>/dev/null || true
+    log_ok "removed $removed old backup(s), freed $((freed/1024/1024)) MiB"
+}
+
+cmd_prune() {
+    require_root; require_installed
+    ensure_cmd jq jq
+    log_step "Prune: dangling images + superseded panel image tags"
+    local current previous
+    current="$(env_get ZAGROS_IMAGE_TAG)"
+    previous="$(jq -r '.from_tag // empty' "$STATE_DIR/last-update.json" 2>/dev/null || true)"
+    docker image prune -f >/dev/null
+    local removed=0 img
+    while IFS= read -r img; do
+        [[ -z "$img" || "$img" == "$current" || "$img" == "$previous" || "$img" == "<none>" ]] && continue
+        docker rmi "$IMAGE_REPO:$img" >/dev/null 2>&1 && removed=$((removed+1)) || true
+    done < <(docker images "$IMAGE_REPO" --format '{{.Tag}}')
+    log_ok "pruned ($removed old image tags removed; kept current=$current${previous:+, previous=$previous} for rollback)"
+}
+
+# ============================================================================= #
+#  help + dispatcher                                                            #
+# ============================================================================= #
+general_help() {
+    cat <<EOF
+${C_BLD}zagros${C_RST} — Zagros multi-core VPN platform, host management CLI $ZAGROS_CLI_VERSION
+
+Usage: zagros <command> [options]
+
+Service lifecycle:
+  install                 one-command install (--database sqlite|mysql|mariadb|postgresql)
+  update                  pre-backup → pull image → migrate → health (auto-rollback on failure)
+  start / stop / restart  classic service control
+  up / down               docker compose up -d / down
+  reload                  recreate the panel container
+  status                  service, image, health and core table
+  logs [svc] [--tail N] [--no-follow]
+  version                 CLI, image, panel and latest-release versions
+
+Operations:
+  doctor [--json]         full system report (docker/db/cores/ports/dns/ghcr/…)
+  health                  quick composite health probe (exit 1 on failure)
+  repair                  safe automatic fixes (dirs, env, image, container, schema)
+  clean [--keep N]        prune old backups
+  prune                   docker image prune + superseded image tags
+
+Backup & restore:
+  backup [--logs]         full backup (db, config, certs, keys, core metadata, runtime config)
+  backup-service          system-only bundle (compose, env, CLI state)
+  restore <file|latest> [--dry-run] [--yes]
+  rollback [--to <tag>] [--backup <file>]
+  migrate                 run schema migrations now
+
+Core management (capability-driven, no core has a special place):
+  list-cores [--json]     installed cores: state/version/health/capabilities
+  install-core <core>     SELF_INSTALL an official core binary
+  update-core <core>      update a core binary (--version X)
+  uninstall-core <core>   dependency-checked removal (--purge/--force)
+  reload-core <core>      restart a single core (panel-aware)
+  sync [--core X]         re-apply all stored accounts to enabled cores
+
+Admin:
+  create-admin [--username U] [--password P] [--sudo]
+  reset-admin  [--username U] [--password P]
+
+Configuration & shell:
+  config [list|get|set|edit|validate|path]
+  shell                   exec into the panel container
+  uninstall [--purge] [--yes]
+
+Everything runs against the REAL services — nothing is simulated.
+Docs: https://github.com/ZagrosGM/zagros-scripts
+EOF
+}
+
+main() {
+    local cmd="${1:-help}"
+    [[ $# -gt 0 ]] && shift || true
+    case "$cmd" in
+        install)          cmd_install "$@" ;;
+        uninstall)        cmd_uninstall "$@" ;;
+        update)           cmd_update "$@" ;;
+        rollback)         cmd_rollback "$@" ;;
+        up)               cmd_up "$@" ;;
+        down)             cmd_down "$@" ;;
+        start)            cmd_start "$@" ;;
+        stop)             cmd_stop "$@" ;;
+        restart)          cmd_restart "$@" ;;
+        reload)           cmd_reload "$@" ;;
+        status)           cmd_status "$@" ;;
+        logs)             cmd_logs "$@" ;;
+        shell)            cmd_shell "$@" ;;
+        health)           cmd_health "$@" ;;
+        doctor)           cmd_doctor "$@" ;;
+        repair)           cmd_repair "$@" ;;
+        version)          cmd_version "$@" ;;
+        backup)           cmd_backup "$@" ;;
+        backup-service)   cmd_backup_service "$@" ;;
+        restore)          cmd_restore "$@" ;;
+        migrate)          cmd_migrate "$@" ;;
+        config)           cmd_config "$@" ;;
+        create-admin)     cmd_create_admin "$@" ;;
+        reset-admin)      cmd_reset_admin "$@" ;;
+        list-cores)       cmd_list_cores "$@" ;;
+        install-core)     cmd_install_core "$@" ;;
+        uninstall-core)   cmd_uninstall_core "$@" ;;
+        update-core)      cmd_update_core "$@" ;;
+        reload-core)      cmd_reload_core "$@" ;;
+        sync)             cmd_sync "$@" ;;
+        clean)            cmd_clean "$@" ;;
+        prune)            cmd_prune "$@" ;;
+        help|--help|-h)   general_help ;;
+        *) log_err "unknown command: $cmd"; echo; general_help; exit 2 ;;
+    esac
+}
+
+main "$@"

@@ -1,0 +1,84 @@
+name: E2E (real VPS)
+
+# The honesty gate: a fresh machine, real Docker, the real GHCR image and the
+# real installer — no doubles. Trigger manually (workflow_dispatch) or on a
+# schedule; results appear in the Actions tab.
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "image tag to install (empty = newest GitHub release)"
+        required: false
+        default: ""
+      database:
+        description: "sqlite | mysql | mariadb | postgresql"
+        required: false
+        default: "sqlite"
+  schedule:
+    - cron: "17 3 * * *"   # nightly, UTC
+
+env:
+  IMAGE: ghcr.io/zagrosgm/zagros
+
+jobs:
+  real-install:
+    name: install → admin → cores → backup/restore → uninstall (${{ github.event.inputs.database || 'sqlite' }})
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install the CLI from this checkout (what zagros.sh would fetch)
+        run: |
+          sudo install -m 0755 zagros /usr/local/bin/zagros
+          zagros version
+
+      - name: zagros install
+        run: |
+          set -e
+          args=(install)
+          db="${{ github.event.inputs.database }}"
+          [[ -n "$db" && "$db" != "sqlite" ]] && args+=(--database "$db")
+          tag="${{ github.event.inputs.version }}"
+          [[ -n "$tag" ]] && args+=(--version "$tag")
+          sudo -E ASSUME_YES=1 zagros "${args[@]}"
+
+      - name: first sudo admin + probes
+        run: |
+          sudo zagros create-admin --username e2e-admin --sudo
+          sudo zagros status
+          sudo zagros health
+          sudo zagros config validate
+          sudo zagros doctor
+          curl -fsSI "http://127.0.0.1:$(sudo zagros config get UVICORN_PORT)/zagros/dashboard" | head -1
+
+      - name: install a core (real upstream binary self-install)
+        run: |
+          sudo zagros install-core sing-box
+          sudo zagros list-cores
+          sudo zagros sync
+
+      - name: backup → mutate → restore
+        run: |
+          set -e
+          # marker lands in the data tarball; then mutate live state
+          echo e2e-marker | sudo tee /var/lib/zagros/.e2e-marker >/dev/null
+          sudo zagros backup
+          sudo rm -f /var/lib/zagros/.e2e-marker
+          sudo sed -i 's/^UVICORN_PORT=.*/UVICORN_PORT=9999/' /opt/zagros/zagros.env
+          sudo zagros restore latest --yes
+          test -f /var/lib/zagros/.e2e-marker
+          test "$(sudo zagros config get UVICORN_PORT)" = "8000"
+          sudo zagros health
+
+      - name: update (re-run — should be a healthy no-op or roll forward)
+        run: |
+          sudo -E ASSUME_YES=1 zagros update -y || sudo zagros rollback --yes
+          sudo zagros status
+
+      - name: logs tail for diagnosis
+        run: sudo zagros logs --tail 30 --no-follow
+
+      - name: uninstall --purge
+        if: always()
+        run: sudo zagros uninstall --purge --yes
