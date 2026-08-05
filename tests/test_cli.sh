@@ -360,6 +360,20 @@ expect_rc "purge uninstall rc0" 0
 expect_no_file "$ZAGROS_DATA" "data purged"
 
 # ----------------------------------------------------------------------------- #
+say "t17 one-liner idempotency: CLI already living at ZAGROS_BIN"
+# Regression (real-VPS E2E catch): the bootstrap one-liner downloads the CLI
+# to $ZAGROS_BIN/zagros and THEN runs it; install must not die on GNU
+# install(1) "are the same file" when src and dst share an inode.
+reset_fake
+install -m 0755 "$CLI" "$ZAGROS_BIN/zagros"
+run bash "$ZAGROS_BIN/zagros" install
+expect_rc "same-inode CLI install rc0" 0
+expect_out "CLI install still logged" "CLI installed"
+expect_file "$ZAGROS_HOME/.state/install.json" "install state recorded (same-inode path)"
+run bash "$ZAGROS_BIN/zagros" uninstall --purge --yes
+expect_rc "cleanup purge rc0" 0
+
+# ----------------------------------------------------------------------------- #
 printf '\n==============================================================\n'
 printf 'CLI tests: %d passed, %d failed\n' "$PASS" "$FAIL"
 if (( FAIL > 0 )); then
