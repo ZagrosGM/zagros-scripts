@@ -370,6 +370,17 @@ run bash "$ZAGROS_BIN/zagros" install
 expect_rc "same-inode CLI install rc0" 0
 expect_out "CLI install still logged" "CLI installed"
 expect_file "$ZAGROS_HOME/.state/install.json" "install state recorded (same-inode path)"
+
+# Regression (real-VPS E2E catch): restore's --yes must skip the prompt even
+# without ASSUME_YES=1 in the environment (it was parsed but silently
+# ignored; this harness masked it via the global ASSUME_YES=1).
+run bash "$ZAGROS_BIN/zagros" backup >/dev/null
+run env -u ASSUME_YES bash "$ZAGROS_BIN/zagros" restore latest --yes
+expect_rc "restore honors --yes without ASSUME_YES" 0
+expect_out "restore completes without ASSUME_YES" "restore complete"
+run env -u ASSUME_YES bash "$ZAGROS_BIN/zagros" restore latest </dev/null
+expect_rc "restore without confirmation aborts" 1
+
 run bash "$ZAGROS_BIN/zagros" uninstall --purge --yes
 expect_rc "cleanup purge rc0" 0
 

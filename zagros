@@ -978,7 +978,9 @@ Restore plan:
   6. auto-rollback to the safety snapshot on failure
 EOF
     if (( dry )); then log_ok "dry-run OK — no changes made"; rm -rf "$staging"; return 0; fi
-    confirm "Proceed with restore?" || { rm -rf "$staging"; die "aborted."; }
+    # --yes parsed above must actually skip the prompt (was silently ignored,
+    # breaking non-interactive restores; caught by the real-VPS E2E).
+    (( yes )) || confirm "Proceed with restore?" || { rm -rf "$staging"; die "aborted."; }
 
     # 1. safety snapshot
     local safety
