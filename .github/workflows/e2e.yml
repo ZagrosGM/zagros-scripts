@@ -50,7 +50,7 @@ jobs:
           sudo zagros health
           sudo zagros config validate
           sudo zagros doctor
-          curl -fsSI "http://127.0.0.1:$(sudo zagros config get UVICORN_PORT)/zagros/dashboard" | head -1
+          curl -fsS "http://127.0.0.1:$(sudo zagros config get UVICORN_PORT)/zagros/dashboard" -o /dev/null -w 'ops UI GET: %{http_code}\n'
 
       - name: install a core (real upstream binary self-install)
         run: |

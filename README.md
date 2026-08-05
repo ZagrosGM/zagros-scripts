@@ -17,7 +17,7 @@ upstream release at runtime, and no core has a special place anywhere.
 
 > **Status: ALPHA** (`v1.0.0-alpha.3`). Suitable for evaluation and lab
 > testing. The CLI's semantics are covered by an end-to-end test suite
-> (`tests/`, 142 assertions) and the in-container bridge by the panel's
+> (`tests/`, 149 assertions) and the in-container bridge by the panel's
 > pytest suite — read *Verification* below honestly before production use.
 
 ---
@@ -186,7 +186,7 @@ run `zagros backup` first regardless).
 
 * **CI on this repo** (`ci.yml`): shellcheck (`-S warning`) for both scripts +
   `bash tests/test_cli.sh` — an end-to-end harness that drives the **real**
-  CLI through 142 assertions (install → config → admin → cores → backup →
+  CLI through 149 assertions (install → config → admin → cores → backup →
   restore → update → forced-failure rollback → doctor → repair → clean/prune
   → uninstall/purge) against a faithful docker/compose/hostctl double
   (`tests/faked/`). GitHub runners additionally run the real-VPS E2E below.
