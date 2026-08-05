@@ -399,10 +399,21 @@ provision_legacy_db() {  # second database on the managed db server
 install_cli_file() {  # install_cli_file — place the running CLI into $ZAGROS_BIN
     local target="$ZAGROS_BIN/zagros"
     mkdir -p "$ZAGROS_BIN"
+    # Idempotency: the bootstrap one-liner already placed the running script
+    # at $target — GNU install(1) fails with "are the same file" when src and
+    # dst share an inode, so refresh the mode and treat it as done.
+    local src=""
     if [[ -n "${ZAGROS_CLI_SELF:-}" && -r "$ZAGROS_CLI_SELF" ]]; then
-        install -m 0755 "$ZAGROS_CLI_SELF" "$target"
+        src="$ZAGROS_CLI_SELF"
     elif [[ "${BASH_SOURCE[0]}" == */zagros && -r "${BASH_SOURCE[0]}" ]]; then
-        install -m 0755 "${BASH_SOURCE[0]}" "$target"
+        src="${BASH_SOURCE[0]}"
+    fi
+    if [[ -n "$src" ]]; then
+        if [[ -e "$target" && "$src" -ef "$target" ]]; then
+            chmod 0755 "$target"
+        else
+            install -m 0755 "$src" "$target"
+        fi
     else
         curl -fsSL "$SCRIPTS_REPO_RAW/$ZAGROS_SCRIPTS_REF/zagros" -o "$target"
         chmod 0755 "$target"
