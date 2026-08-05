@@ -55,7 +55,7 @@ jobs:
           #    used to be silently forced to 127.0.0.1 without TLS)
           test "$(sudo zagros config get UVICORN_HOST)" = "0.0.0.0"
           sudo ss -lntp | grep -q '0.0.0.0:8000'
-          curl -fsS "http://127.0.0.1:8000/zagros/dashboard" -o /dev/null -w 'bind check on .0:8000: %{http_code}\n'
+          curl -fsS "http://127.0.0.1:8000/dashboard/" -o /dev/null -w 'bind check on .0:8000: %{http_code}\n'
 
       - name: first sudo admin + probes
         run: |
@@ -64,7 +64,7 @@ jobs:
           sudo zagros health
           sudo zagros config validate
           sudo zagros doctor
-          curl -fsS "http://127.0.0.1:$(sudo zagros config get UVICORN_PORT)/zagros/dashboard" -o /dev/null -w 'ops UI GET: %{http_code}\n'
+          curl -fsS "http://127.0.0.1:$(sudo zagros config get UVICORN_PORT)/dashboard/" -o /dev/null -w 'ops UI GET: %{http_code}\n'
 
       - name: edit .env → restart applies it (port roundtrip 8000 → 8080 → 8000)
         run: |
@@ -72,10 +72,10 @@ jobs:
           sudo zagros config set UVICORN_PORT 8080 --restart
           test "$(sudo zagros config get UVICORN_PORT)" = "8080"
           sudo ss -lntp | grep -q '0.0.0.0:8080'
-          curl -fsS "http://127.0.0.1:8080/zagros/dashboard" -o /dev/null -w 'dashboard on 8080: %{http_code}\n'
+          curl -fsS "http://127.0.0.1:8080/dashboard/" -o /dev/null -w 'dashboard on 8080: %{http_code}\n'
           sudo zagros config set UVICORN_PORT 8000 --restart
           sudo ss -lntp | grep -q '0.0.0.0:8000'
-          curl -fsS "http://127.0.0.1:8000/zagros/dashboard" -o /dev/null -w 'dashboard back on 8000: %{http_code}\n'
+          curl -fsS "http://127.0.0.1:8000/dashboard/" -o /dev/null -w 'dashboard back on 8000: %{http_code}\n'
           sudo zagros config reload
           sudo zagros config show | grep -q '^UVICORN_PORT=8000'
 

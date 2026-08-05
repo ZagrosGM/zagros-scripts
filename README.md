@@ -15,7 +15,7 @@ and messages — nothing is simulated; and the stack is **core-agnostic**: no
 core binary is baked into the image, every core self-installs its official
 upstream release at runtime, and no core has a special place anywhere.
 
-> **Status: ALPHA** (`v1.0.0-alpha.4`). Suitable for evaluation and lab
+> **Status: ALPHA** (`v1.0.0-alpha.5`). Suitable for evaluation and lab
 > testing. The CLI's semantics are covered by an end-to-end test suite
 > (`tests/`, 189 assertions) and the in-container bridge by the panel's
 > pytest suite — read *Verification* below honestly before production use.
@@ -44,8 +44,12 @@ sudo zagros doctor                    # full diagnostic report
 sudo zagros install-core xray         # self-install an official core binary
 ```
 
-Dashboard: `http://<server-ip>:8000/dashboard/` · Ops: `/zagros/dashboard` ·
-Config Studio: `/zagros/studio`
+**The panel (exactly one):** `http://<server-ip>:8000/dashboard/` — the unified
+Zagros dashboard. Cores, routing, outbounds, inbounds, DNS, certificates,
+sessions and devices are all managed there, and the Config Studio lives
+inside it as *Settings → Advanced Mode*. There is deliberately **no second
+panel** (the legacy `/zagros/dashboard` and `/zagros/studio` routes were
+removed in `v1.0.0-alpha.5` and return 404).
 
 ### What `install` does (exactly, and nothing else)
 

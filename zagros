@@ -24,7 +24,7 @@
 # =============================================================================
 set -euo pipefail
 
-ZAGROS_CLI_VERSION="1.0.0-alpha.4"
+ZAGROS_CLI_VERSION="1.0.0-alpha.5"
 SCRIPTS_REPO_RAW="https://raw.githubusercontent.com/ZagrosGM/zagros-scripts"
 PANEL_REPO="ZagrosGM/Zagros"
 PANEL_API="https://api.github.com/repos/${PANEL_REPO}"
@@ -285,7 +285,7 @@ services:
       - __DATA_DIR__:/var/lib/zagros
     healthcheck:
       # no env injection → the probe reads UVICORN_PORT from the mounted file
-      test: ["CMD", "python3", "-c", "import urllib.request;p=next((l.split('=',1)[1].strip().strip(chr(34)).strip(chr(39)) for l in open('/code/.env',encoding='utf-8') if l.split('=',1)[0].strip()=='UVICORN_PORT'),'8000');urllib.request.urlopen('http://127.0.0.1:'+str(int(p))+'/zagros/dashboard',timeout=3).close()"]
+      test: ["CMD", "python3", "-c", "import urllib.request;p=next((l.split('=',1)[1].strip().strip(chr(34)).strip(chr(39)) for l in open('/code/.env',encoding='utf-8') if l.split('=',1)[0].strip()=='UVICORN_PORT'),'8000');urllib.request.urlopen('http://127.0.0.1:'+str(int(p))+'/dashboard/',timeout=3).close()"]
       interval: 20s
       timeout: 8s
       retries: 6
@@ -675,14 +675,13 @@ cmd_install() {
 
 Next steps:
   1. Create the first sudo admin:   zagros create-admin --sudo
-  2. Open the dashboard:            http://<server-ip>:$(env_get UVICORN_PORT)/dashboard/
-     Zagros Ops dashboard:          http://<server-ip>:$(env_get UVICORN_PORT)/zagros/dashboard
-     Config Studio:                 http://<server-ip>:$(env_get UVICORN_PORT)/zagros/studio
+  2. Open THE panel (one panel only): http://<server-ip>:$(env_get UVICORN_PORT)/dashboard/
+     (cores, routing, outbounds, inbounds, DNS, certificates, sessions and
+      devices all live there; Config Studio = its Settings → Advanced Mode)
   3. Configure anything:            zagros config edit   (file: $ENV_FILE)
      then apply it all:             zagros restart
   4. Install a core when needed:    zagros install-core <xray|sing-box|hysteria2|tuic|...>
-     (cores self-install their official binaries at runtime — nothing is
-      baked into the image and no core has a special place)
+     (or from the panel: Cores → catalog → install — same capability engine)
 EOF
 }
 install_help() {
@@ -697,7 +696,7 @@ zagros install — one-command installation
 Examples:
   sudo bash -c "\$(curl -fsSL $SCRIPTS_REPO_RAW/main/zagros.sh)" -- install
   zagros install --database postgresql
-  zagros install --database mysql --version v1.0.0-alpha.4
+  zagros install --database mysql --version v1.0.0-alpha.5
 EOF
 }
 
