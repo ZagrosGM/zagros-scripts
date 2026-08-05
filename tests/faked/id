@@ -1,0 +1,4 @@
+#!/usr/bin/env bash
+# Test double: report uid 0 so require_root paths can run as a normal CI user.
+# Only used inside tests/ (prepended to PATH by test_cli.sh).
+if [[ "${1:-}" == "-u" ]]; then echo 0; else /usr/bin/id "$@"; fi
