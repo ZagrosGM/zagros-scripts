@@ -43,6 +43,20 @@ jobs:
           [[ -n "$tag" ]] && args+=(--version "$tag")
           sudo -E ASSUME_YES=1 zagros "${args[@]}"
 
+      - name: config contract (.env-only, mount-only, verbatim bind host)
+        run: |
+          set -e
+          # 1) the panel is configured by /opt/zagros/.env — and only by it
+          test -f /opt/zagros/.env
+          test ! -e /opt/zagros/zagros.env
+          grep -q './.env:/code/.env:ro' /opt/zagros/docker-compose.yml
+          ! grep -q 'env_file:' /opt/zagros/docker-compose.yml
+          # 2) bind host from .env is honored VERBATIM (alpha.4 regression:
+          #    used to be silently forced to 127.0.0.1 without TLS)
+          test "$(sudo zagros config get UVICORN_HOST)" = "0.0.0.0"
+          sudo ss -lntp | grep -q '0.0.0.0:8000'
+          curl -fsS "http://127.0.0.1:8000/zagros/dashboard" -o /dev/null -w 'bind check on .0:8000: %{http_code}\n'
+
       - name: first sudo admin + probes
         run: |
           sudo zagros create-admin --username e2e-admin --sudo
@@ -51,6 +65,19 @@ jobs:
           sudo zagros config validate
           sudo zagros doctor
           curl -fsS "http://127.0.0.1:$(sudo zagros config get UVICORN_PORT)/zagros/dashboard" -o /dev/null -w 'ops UI GET: %{http_code}\n'
+
+      - name: edit .env → restart applies it (port roundtrip 8000 → 8080 → 8000)
+        run: |
+          set -e
+          sudo zagros config set UVICORN_PORT 8080 --restart
+          test "$(sudo zagros config get UVICORN_PORT)" = "8080"
+          sudo ss -lntp | grep -q '0.0.0.0:8080'
+          curl -fsS "http://127.0.0.1:8080/zagros/dashboard" -o /dev/null -w 'dashboard on 8080: %{http_code}\n'
+          sudo zagros config set UVICORN_PORT 8000 --restart
+          sudo ss -lntp | grep -q '0.0.0.0:8000'
+          curl -fsS "http://127.0.0.1:8000/zagros/dashboard" -o /dev/null -w 'dashboard back on 8000: %{http_code}\n'
+          sudo zagros config reload
+          sudo zagros config show | grep -q '^UVICORN_PORT=8000'
 
       - name: install a core (real upstream binary self-install)
         run: |
@@ -65,7 +92,7 @@ jobs:
           echo e2e-marker | sudo tee /var/lib/zagros/.e2e-marker >/dev/null
           sudo zagros backup
           sudo rm -f /var/lib/zagros/.e2e-marker
-          sudo sed -i 's/^UVICORN_PORT=.*/UVICORN_PORT=9999/' /opt/zagros/zagros.env
+          sudo sed -i 's/^UVICORN_PORT=.*/UVICORN_PORT=9999/' /opt/zagros/.env
           sudo zagros restore latest --yes
           test -f /var/lib/zagros/.e2e-marker
           test "$(sudo zagros config get UVICORN_PORT)" = "8000"

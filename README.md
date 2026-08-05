@@ -15,9 +15,9 @@ and messages — nothing is simulated; and the stack is **core-agnostic**: no
 core binary is baked into the image, every core self-installs its official
 upstream release at runtime, and no core has a special place anywhere.
 
-> **Status: ALPHA** (`v1.0.0-alpha.3`). Suitable for evaluation and lab
+> **Status: ALPHA** (`v1.0.0-alpha.4`). Suitable for evaluation and lab
 > testing. The CLI's semantics are covered by an end-to-end test suite
-> (`tests/`, 149 assertions) and the in-container bridge by the panel's
+> (`tests/`, 189 assertions) and the in-container bridge by the panel's
 > pytest suite — read *Verification* below honestly before production use.
 
 ---
@@ -52,9 +52,9 @@ Config Studio: `/zagros/studio`
 1. Installs Docker via the official `get.docker.com` script when missing
    (skip with `--no-docker-install`).
 2. Writes `/opt/zagros/docker-compose.yml` (host networking, healthchecks;
-   panel service + optional `zagros-db`) and `/opt/zagros/zagros.env`
+   panel service + optional `zagros-db`) and `/opt/zagros/.env`
    (`0600`, generated secrets — credentials are never printed or passed on
-   any command line).
+   any command line, and the compose file itself stays secret-free).
 3. Resolves the newest GitHub release tag (override: `--version vX.Y.Z`,
    `--channel stable|latest`), pulls `ghcr.io/zagrosgm/zagros:<tag>` and
    starts the stack.
@@ -74,12 +74,43 @@ ones are auto-installed from your distro packages when possible.
 
 | Path | Env override | Contents |
 |---|---|---|
-| `/opt/zagros` | `ZAGROS_HOME` | compose file, env, CLI state |
+| `/opt/zagros` | `ZAGROS_HOME` | compose file, **`.env`** (THE configuration), CLI state |
 | `/var/lib/zagros` | `ZAGROS_DATA` | databases (sqlite), cores, backups, logs, certs, keys |
 | `/usr/local/bin` | `ZAGROS_BIN` | the `zagros` CLI |
 
 Images come **exclusively from GHCR** (`ghcr.io/zagrosgm/zagros`). Docker Hub
 is not used.
+
+---
+
+## Configuration (`.env` — the single source of truth)
+
+Same operator model as Marzban, with its sharp edges removed:
+
+* Everything lives in **one file**: `/opt/zagros/.env`. The docker compose
+  project only **mounts** it into the container (`./.env:/code/.env:ro`) —
+  nothing is injected into the container environment and nothing is baked
+  into the image.
+* **Edit → `zagros restart` applies everything.** `restart` recreates the
+  panel container, which guarantees `.env` edits take effect no matter how
+  the file was modified (editor renames included). No hidden caching, no
+  stale settings.
+* `UVICORN_HOST` is honored **verbatim** — the runtime never rewrites it
+  (the historical "forced to 127.0.0.1 without TLS" trap is fixed in the
+  panel as of `v1.0.0-alpha.4`).
+* `TLS_MODE`: `auto` (default; TLS when both SSL files are set), `on`
+  (require TLS, refuse to boot without it), `off` (force plain HTTP for
+  reverse-proxy setups).
+* A legacy `/opt/zagros/zagros.env` is migrated to `.env` **automatically**
+  by any CLI command (and by the panel itself), kept as
+  `zagros.env.migrated`. Backups created by older CLIs restore straight
+  into the new layout, including conversion of the old injection-style
+  compose file.
+
+CLI cheatsheet: `zagros config show` (masked overview) ·
+`zagros config get KEY` · `zagros config set KEY VALUE [--restart]` ·
+`zagros config edit` ($EDITOR + restart) · `zagros config reload`
+(validate + apply) · `zagros config validate` · `zagros config path`.
 
 ---
 
@@ -94,9 +125,10 @@ is not used.
 |---|---|
 | `install [--database sqlite\|mysql\|mariadb\|postgresql] [--version <tag>] [--channel stable\|latest] [--no-docker-install]` | One-command installation (see above). |
 | `update [--version <tag>] [--channel stable\|latest] [--no-backup] [--force] [-y]` | Pre-backup → tag/GHCR-digest check → pull → migrate → health gate → **auto-rollback on failure**. |
-| `start` / `stop` / `restart` | Classic service control with health wait. |
+| `start` / `stop` | Classic service control with health wait. |
+| `restart` | Recreate the panel — **always applies `.env` edits** (health gate). |
 | `up` / `down` | `compose up -d` / `compose down` (data preserved). |
-| `reload` | Recreate the panel container (config reload). |
+| `reload` | Recreate the panel container (same as `restart`). |
 | `status` | Panel version, image tag, health, db kind, listeners, core table. |
 | `logs [zagros\|zagros-db] [--tail N] [--no-follow]` | Service logs (follows by default). |
 | `shell` | `exec` into the panel container (`bash`, falls back to `sh`). |
@@ -146,7 +178,13 @@ When a core is running under the live panel process the answer is
 |---|---|
 | `create-admin [--username U] [--password P] [--sudo]` | Create a sudo/normal admin; generates a one-time-shown password when omitted. |
 | `reset-admin [--username U] [--password P]` | Reset an admin's password. |
-| `config list\|get\|set\|edit\|validate\|path` | Manage `/opt/zagros/zagros.env`; `list` masks secrets; `set` guards `ZAGROS_SECRET_KEY` rotation over an existing database (`--force` to override, `--restart` to apply); `validate` catches missing keys, bad ports, and the P3/legacy same-SQLite-file collision. |
+| `config [show]` | Print `/opt/zagros/.env` with secrets masked (`list` is an alias; `show` is the default action). |
+| `config get KEY` | Print one value. |
+| `config set KEY VALUE [--force] [--restart]` | Write one value **in place** (same inode, so the bind mount stays live); guards `ZAGROS_SECRET_KEY` rotation over an existing database (`--force` to override, `--restart` to apply). |
+| `config edit` | Open `.env` in `$EDITOR`, then offer to restart. |
+| `config reload` | Validate + restart — applies `.env` immediately. |
+| `config validate` | Catches missing keys, bad ports, invalid `TLS_MODE`, `TLS_MODE=on` without cert/key, and the P3/legacy same-SQLite-file collision. |
+| `config path` | Print the `.env` location. |
 
 ---
 
@@ -170,9 +208,9 @@ run `zagros backup` first regardless).
 
 ## Security notes
 
-* `zagros.env` and every backup archive are `0600`; db credentials exist only
-  inside files — never on any command line (compose healthchecks use the
-  env-interpolated values).
+* `.env` and every backup archive are `0600`; db credentials exist only
+  inside `.env` — never on any command line and never baked into the
+  compose file (compose interpolates them from `.env` at runtime).
 * `backup`/`update` never proceed without a completed pre-backup unless you
   explicitly pass `--no-backup`.
 * `repair` and `config set` refuse to auto-rotate `ZAGROS_SECRET_KEY` when a
@@ -186,7 +224,7 @@ run `zagros backup` first regardless).
 
 * **CI on this repo** (`ci.yml`): shellcheck (`-S warning`) for both scripts +
   `bash tests/test_cli.sh` — an end-to-end harness that drives the **real**
-  CLI through 149 assertions (install → config → admin → cores → backup →
+  CLI through 189 assertions (install → config → admin → cores → backup →
   restore → update → forced-failure rollback → doctor → repair → clean/prune
   → uninstall/purge) against a faithful docker/compose/hostctl double
   (`tests/faked/`). GitHub runners additionally run the real-VPS E2E below.

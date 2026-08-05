@@ -24,7 +24,7 @@
 # =============================================================================
 set -euo pipefail
 
-ZAGROS_CLI_VERSION="1.0.0-alpha.3"
+ZAGROS_CLI_VERSION="1.0.0-alpha.4"
 SCRIPTS_REPO_RAW="https://raw.githubusercontent.com/ZagrosGM/zagros-scripts"
 PANEL_REPO="ZagrosGM/Zagros"
 PANEL_API="https://api.github.com/repos/${PANEL_REPO}"
@@ -35,7 +35,12 @@ ZAGROS_DATA="${ZAGROS_DATA:-/var/lib/zagros}"
 ZAGROS_BIN="${ZAGROS_BIN:-/usr/local/bin}"
 ZAGROS_SCRIPTS_REF="${ZAGROS_SCRIPTS_REF:-main}"
 COMPOSE_FILE="$ZAGROS_HOME/docker-compose.yml"
-ENV_FILE="$ZAGROS_HOME/zagros.env"
+# Configuration contract: ONE .env file is the single source of truth.
+# docker compose only MOUNTS it into the container (no env injection), and
+# the panel resolves it CWD-independently. A legacy zagros.env is migrated
+# automatically (see migrate_env_file).
+ENV_FILE="$ZAGROS_HOME/.env"
+LEGACY_ENV_FILE="$ZAGROS_HOME/zagros.env"
 STATE_DIR="$ZAGROS_HOME/.state"
 BACKUP_DIR="$ZAGROS_DATA/backups"
 SERVICE="zagros"
@@ -109,7 +114,16 @@ compose_probe() {  # sets global COMPOSE=(...)
     elif command -v docker-compose >/dev/null 2>&1; then COMPOSE=(docker-compose)
     else die "Neither the Docker Compose plugin nor 'docker-compose' is available. Install the compose plugin: https://docs.docker.com/compose/install/linux/"; fi
 }
-compose()     { compose_probe; "${COMPOSE[@]}" -f "$COMPOSE_FILE" --env-file "$ENV_FILE" "$@"; }
+compose()     { compose_probe
+                # --env-file makes .env available for compose interpolation
+                # (${ZAGROS_IMAGE_TAG}, db credentials). Without it, compose
+                # auto-loads <project-dir>/.env — the same file — so degrade
+                # gracefully during broken/uninstalled states.
+                if [[ -f "$ENV_FILE" ]]; then
+                    "${COMPOSE[@]}" -f "$COMPOSE_FILE" --env-file "$ENV_FILE" "$@"
+                else
+                    "${COMPOSE[@]}" -f "$COMPOSE_FILE" "$@"
+                fi }
 panel_exec()  { compose exec -T "$SERVICE" "$@"; }
 hostctl()     { panel_exec python3 -m app.platform.hostctl "$@"; }
 
@@ -131,19 +145,42 @@ hostctl_json() {
 # --------------------------------------------------------------------------- #
 #  env file helpers                                                           #
 # --------------------------------------------------------------------------- #
-env_get() {  # env_get KEY — value from $ENV_FILE (empty if absent)
+env_get() {  # env_get KEY — value from $ENV_FILE (empty if absent).
+             # NEVER fails: under `set -o pipefail`, a missing key makes
+             # grep exit 1 → would abort any `x="$(env_get ...)"` caller.
     [[ -f "$ENV_FILE" ]] || { printf ''; return 0; }
-    grep -E "^$1=" "$ENV_FILE" | tail -1 | cut -d= -f2-
+    grep -E "^$1=" "$ENV_FILE" | tail -1 | cut -d= -f2- || true
 }
-env_set() {  # env_set KEY VALUE
+env_set() {  # env_set KEY VALUE — edits $ENV_FILE IN PLACE (inode kept)
     local key="$1" value="$2"
     [[ "$key" =~ ^[A-Z][A-Z0-9_]*$ ]] || die "invalid env key: $key"
     touch "$ENV_FILE"
     if grep -qE "^$key=" "$ENV_FILE"; then
-        sed -i "s|^$key=.*|$key=$value|" "$ENV_FILE"
+        # sed -i replaces the file (new inode) — that would hide the edit
+        # behind an existing bind-mount until the next recreate. Write
+        # through the SAME inode instead, so a plain `compose restart`
+        # (process re-exec) already sees the new value.
+        local tmp="$ENV_FILE.tmp.$$"
+        sed "s|^$key=.*|$key=$value|" "$ENV_FILE" > "$tmp" \
+            && cat "$tmp" > "$ENV_FILE" && rm -f "$tmp"
     else
         printf '%s=%s\n' "$key" "$value" >> "$ENV_FILE"
     fi
+}
+migrate_env_file() {  # legacy zagros.env → .env (idempotent, never fatal)
+    [[ -f "$LEGACY_ENV_FILE" && ! -f "$ENV_FILE" ]] || return 0
+    if [[ ! -d "$ZAGROS_HOME" || ! -w "$ZAGROS_HOME" ]]; then
+        log_warn "legacy zagros.env found but $ZAGROS_HOME is not writable — run any zagros command as root to auto-migrate"
+        return 0
+    fi
+    if cp -a "$LEGACY_ENV_FILE" "$ENV_FILE"; then
+        chmod 600 "$ENV_FILE" 2>/dev/null || true
+        mv "$LEGACY_ENV_FILE" "$LEGACY_ENV_FILE.migrated"
+        log_warn "migrated legacy zagros.env → $ENV_FILE (kept as zagros.env.migrated)"
+    else
+        log_warn "automatic migration of $LEGACY_ENV_FILE failed — continuing without it"
+    fi
+    return 0
 }
 mask_secret() { local v="$1"; if ((${#v} > 8)); then printf '%s…%s' "${v:0:4}" "${v: -4}"; else printf '****'; fi; }
 gen_secret() { openssl rand -hex "${1:-24}"; }
@@ -233,18 +270,22 @@ render_compose() {  # render_compose <db-kind> — writes $COMPOSE_FILE
     panel_svc=$(cat <<'YAML'
 services:
   zagros:
-    # The tag is interpolated by compose from zagros.env (--env-file), so
-    # `zagros update` only needs to flip ZAGROS_IMAGE_TAG and re-pull.
+    # The tag is interpolated by compose from the ./.env file (--env-file),
+    # so `zagros update` only needs to flip ZAGROS_IMAGE_TAG and re-pull.
     image: __IMAGE_REPO__:${ZAGROS_IMAGE_TAG:-latest}
     container_name: zagros
     restart: always
     network_mode: host
-    env_file:
-      - zagros.env
+    # Configuration contract: compose only MOUNTS the .env file — NOTHING is
+    # injected into the container environment, so the file is the only
+    # configuration source. Edit ./.env (or `zagros config edit`), then
+    # `zagros restart` applies every setting.
     volumes:
+      - ./.env:/code/.env:ro
       - __DATA_DIR__:/var/lib/zagros
     healthcheck:
-      test: ["CMD", "python3", "-c", "import os,urllib.request;urllib.request.urlopen('http://127.0.0.1:'+str(int(os.environ.get('UVICORN_PORT','8000')))+'/zagros/dashboard',timeout=3).close()"]
+      # no env injection → the probe reads UVICORN_PORT from the mounted file
+      test: ["CMD", "python3", "-c", "import urllib.request;p=next((l.split('=',1)[1].strip().strip(chr(34)).strip(chr(39)) for l in open('/code/.env',encoding='utf-8') if l.strip().startswith('UVICORN_PORT=')),'8000');urllib.request.urlopen('http://127.0.0.1:'+str(int(p))+'/zagros/dashboard',timeout=3).close()"]
       interval: 20s
       timeout: 8s
       retries: 6
@@ -258,20 +299,22 @@ YAML
             db_svc=$(cat <<YAML
 
   zagros-db:
+    # Credentials live ONLY in ./.env (mode 600) — compose interpolates the
+    # \${ZAGROS_DB_*} values from it; this file itself stays secret-free.
     image: $img
     container_name: zagros-db
     restart: always
     network_mode: host
-    command: ["--port=__DB_PORT__", "--character-set-server=utf8mb4", "--collation-server=utf8mb4_unicode_ci"]
+    command: ["--port=\${ZAGROS_DB_PORT:-3306}", "--character-set-server=utf8mb4", "--collation-server=utf8mb4_unicode_ci"]
     environment:
-      MYSQL_ROOT_PASSWORD: __DB_ROOT_PASSWORD__
+      MYSQL_ROOT_PASSWORD: \${ZAGROS_DB_ROOT_PASSWORD:?set ZAGROS_DB_ROOT_PASSWORD in .env}
       MYSQL_DATABASE: zagros
-      MYSQL_USER: __DB_USER__
-      MYSQL_PASSWORD: __DB_PASSWORD__
+      MYSQL_USER: \${ZAGROS_DB_USER:-zagros}
+      MYSQL_PASSWORD: \${ZAGROS_DB_PASSWORD:?set ZAGROS_DB_PASSWORD in .env}
     volumes:
       - __DATA_DIR__/db:/var/lib/mysql
     healthcheck:
-      test: ["CMD", "mysqladmin", "ping", "-h", "127.0.0.1", "--port=__DB_PORT__", "--silent", "--password=__DB_ROOT_PASSWORD__"]
+      test: ["CMD", "mysqladmin", "ping", "-h", "127.0.0.1", "--port=\${ZAGROS_DB_PORT:-3306}", "--silent", "--password=\${ZAGROS_DB_ROOT_PASSWORD:?set ZAGROS_DB_ROOT_PASSWORD in .env}"]
       interval: 10s
       timeout: 5s
       retries: 12
@@ -283,19 +326,21 @@ YAML
             db_svc=$(cat <<'YAML'
 
   zagros-db:
+    # Credentials live ONLY in ./.env (mode 600) — compose interpolates the
+    # ${ZAGROS_DB_*} values from it; this file itself stays secret-free.
     image: postgres:17
     container_name: zagros-db
     restart: always
     network_mode: host
-    command: ["-p", "__DB_PORT__"]
+    command: ["-p", "${ZAGROS_DB_PORT:-5432}"]
     environment:
       POSTGRES_DB: zagros
-      POSTGRES_USER: __DB_USER__
-      POSTGRES_PASSWORD: __DB_PASSWORD__
+      POSTGRES_USER: ${ZAGROS_DB_USER:-zagros}
+      POSTGRES_PASSWORD: ${ZAGROS_DB_PASSWORD:?set ZAGROS_DB_PASSWORD in .env}
     volumes:
       - __DATA_DIR__/db:/var/lib/postgresql/data
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U __DB_USER__ -d zagros -p __DB_PORT__ -h 127.0.0.1"]
+      test: ["CMD-SHELL", "pg_isready -U ${ZAGROS_DB_USER:-zagros} -d zagros -p ${ZAGROS_DB_PORT:-5432} -h 127.0.0.1"]
       interval: 10s
       timeout: 5s
       retries: 12
@@ -314,21 +359,7 @@ YAML
     chmod 640 "$COMPOSE_FILE"
 }
 
-# substitute db credentials into the compose file (they live only in files
-# with 600 perms — never on any command line)
-render_db_secrets() {
-    local port="$1" user="$2" password="$3" root_password="${4:-}"
-    sed -i \
-        -e "s|__DB_PORT__|$port|g" \
-        -e "s|__DB_USER__|$user|g" \
-        -e "s|__DB_PASSWORD__|$password|g" \
-        -e "s|__DB_ROOT_PASSWORD__|$root_password|g" \
-        "$COMPOSE_FILE"
-    chmod 640 "$COMPOSE_FILE"
-}
-
-render_env() {  # render_env <db-kind> <image-tag> — writes $ENV_FILE and
-                # prints generated db credentials as KEY=VALUE lines (stdout)
+render_env() {  # render_env <db-kind> <image-tag> — writes the full $ENV_FILE
     local db_kind="$1" tag="$2"
     local secret legacy_url platform_url db_port="" db_user="" db_pass="" db_root=""
     secret="$(gen_secret 32)"
@@ -352,25 +383,119 @@ render_env() {  # render_env <db-kind> <image-tag> — writes $ENV_FILE and
         *) die "unknown database kind: $db_kind (expected sqlite|mysql|mariadb|postgresql)" ;;
     esac
     cat > "$ENV_FILE" <<EOF
-# Zagros panel environment — generated by zagros $ZAGROS_CLI_VERSION on $(date -u +%Y-%m-%dT%H:%M:%SZ)
-# Edit via: zagros config edit | zagros config set KEY VALUE
+# ════════════════════════════════════════════════════════════════════════
+#  Zagros configuration — THE single source of truth (.env)
+#  Generated by zagros $ZAGROS_CLI_VERSION on $(date -u +%Y-%m-%dT%H:%M:%SZ)
+#  Keep this file private (mode 600) — it contains database credentials
+#  and the platform's master secret.
+#
+#  docker compose only MOUNTS this file (./.env → /code/.env) — nothing is
+#  baked into the image, so editing this file + restarting applies it all:
+#
+#    interactive editor    zagros config edit
+#    one key               zagros config set KEY VALUE [--restart]
+#    apply every change    zagros restart          (recreates the panel)
+#    quick apply (in-place edits) zagros config reload
+#    overview (masked)     zagros config show
+# ════════════════════════════════════════════════════════════════════════
+
+# ── installer bookkeeping (used by the zagros CLI / compose, not the panel)
 ZAGROS_IMAGE_TAG=$tag
 ZAGROS_DB_KIND=$db_kind
-ZAGROS_SECRET_KEY=$secret
-ZAGROS_DATABASE_URL=$platform_url
-SQLALCHEMY_DATABASE_URL=$legacy_url
+
+# ── identity / domain ──
+# Public hostname of this panel — once set, PANEL_BASE_URL / APP_BASE_URL
+# and absolute subscription links are derived from it automatically.
+# DOMAIN=panel.example.com
+# PANEL_BASE_URL=https://panel.example.com
+# APP_BASE_URL=https://panel.example.com
+
+# ── HTTP bind & TLS ──
+# The bind host is honored VERBATIM — nothing in the runtime rewrites it.
 UVICORN_HOST=0.0.0.0
 UVICORN_PORT=${UVICORN_PORT:-8000}
+# TLS_MODE: auto | on | off
+#   auto = TLS when both SSL files below are set, otherwise plain HTTP
+#   on   = TLS required — the panel refuses to boot without cert+key
+#   off  = force plain HTTP (a reverse proxy terminates TLS upstream)
+TLS_MODE=auto
+# UVICORN_SSL_CERTFILE=/var/lib/zagros/certs/fullchain.pem
+# UVICORN_SSL_KEYFILE=/var/lib/zagros/certs/key.pem
+# UVICORN_SSL_CA_CERTFILE=/var/lib/zagros/certs/ca.pem
+# UVICORN_SSL_CA_TYPE=public
+# UVICORN_UDS=
+
+# ── database ──
+ZAGROS_DATABASE_URL=$platform_url
+SQLALCHEMY_DATABASE_URL=$legacy_url
+# SQLALCHEMY_POOL_SIZE=10
+# SQLIALCHEMY_MAX_OVERFLOW=30
+
+# ── security ──
+ZAGROS_SECRET_KEY=$secret
+# CORS allow-list (comma separated; empty = same-origin only, never "*")
 ALLOWED_ORIGINS=
+# HTTP Host-header allow-list (comma separated; empty = no restriction)
+TRUSTED_HOSTS=
+
+# ── dashboard ──
+DASHBOARD_PATH=/dashboard/
+
+# ── subscription ──
+# SUBSCRIPTION_URL_PREFIX=https://panel.example.com   (default: from DOMAIN)
+# SUBSCRIPTION_PATH=sub
+# SUBSCRIPTION_TEMPLATE=subscription/index.html
+# SUB_PROFILE_TITLE=Subscription
+# SUB_SUPPORT_URL=https://t.me/support
+# SUB_UPDATE_INTERVAL=12
+
+# ── client app / branding ──
+ZAGROS_PORTAL_TITLE=اشتراک من
+ZAGROS_APP_NAME=Zagros
+# ZAGROS_CLIENT_AUTH_MODE=subscription_link
+
+# ── drivers / cores ──
+# XRAY_JSON=./xray_config.json
+# XRAY_EXECUTABLE_PATH=/usr/local/bin/xray
+# XRAY_ASSETS_PATH=/usr/local/share/xray
+# Additional cores are managed from the panel/CLI (zagros list-cores) —
+# their settings live in the database, not here.
+# DISABLE_RECORDING_NODE_USAGE=false
+
+# ── telegram ──
+# TELEGRAM_API_TOKEN=
+# TELEGRAM_ADMIN_ID=
+# TELEGRAM_LOGGER_CHANNEL_ID=
+# TELEGRAM_DEFAULT_VLESS_FLOW=
+# TELEGRAM_PROXY_URL=
+
+# ── notifications / webhooks ──
+# DISCORD_WEBHOOK_URL=
+# WEBHOOK_ADDRESS=
+# WEBHOOK_SECRET=
+# NOTIFY_DAYS_LEFT=3,7
+# NOTIFY_REACHED_USAGE_PERCENT=80,90
+
+# ── jobs (seconds) ──
+# JOB_CORE_HEALTH_CHECK_INTERVAL=10
+# JOB_RECORD_NODE_USAGES_INTERVAL=30
+# JOB_RECORD_USER_USAGES_INTERVAL=10
+# JOB_REVIEW_USERS_INTERVAL=10
+# JOB_SEND_NOTIFICATIONS_INTERVAL=30
+
+# ── reserved (roadmap — documented, NOT wired yet) ──
+# SMTP_HOST / SMTP_PORT / SMTP_USERNAME / SMTP_PASSWORD / SMTP_FROM
+# OAUTH_GOOGLE_CLIENT_ID / OAUTH_GOOGLE_CLIENT_SECRET
+# OAUTH_GITHUB_CLIENT_ID / OAUTH_GITHUB_CLIENT_SECRET
 EOF
     if [[ "$db_kind" != "sqlite" ]]; then
         {
+            printf '\n# ── managed database service (compose interpolates these) ──\n'
             printf 'ZAGROS_DB_PORT=%s\n' "$db_port"
             printf 'ZAGROS_DB_USER=%s\n' "$db_user"
             printf 'ZAGROS_DB_PASSWORD=%s\n' "$db_pass"
+            [[ -n "$db_root" ]] && printf 'ZAGROS_DB_ROOT_PASSWORD=%s\n' "$db_root"
         } >> "$ENV_FILE"
-        printf 'DB_PORT=%s\nDB_USER=%s\nDB_PASSWORD=%s\nDB_ROOT_PASSWORD=%s\n' \
-            "$db_port" "$db_user" "$db_pass" "$db_root"
     fi
     chmod 600 "$ENV_FILE"
 }
@@ -380,7 +505,7 @@ provision_legacy_db() {  # second database on the managed db server
     case "$db_kind" in
         mysql|mariadb)
             local root_pw
-            root_pw="$(grep -oE 'MYSQL_ROOT_PASSWORD: .*' "$COMPOSE_FILE" | head -1 | cut -d' ' -f2-)"
+            root_pw="$(env_get ZAGROS_DB_ROOT_PASSWORD)"
             docker exec -e MYSQL_PWD="$root_pw" "$DB_SERVICE" \
                 mysql -h127.0.0.1 --port="$(env_get ZAGROS_DB_PORT)" -uroot \
                 -e "CREATE DATABASE IF NOT EXISTS zagros_legacy CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci; GRANT ALL PRIVILEGES ON zagros_legacy.* TO '$(env_get ZAGROS_DB_USER)'@'%'; FLUSH PRIVILEGES;"
@@ -507,17 +632,8 @@ cmd_install() {
     [[ -n "$version" ]] || version="$(resolve_version "$channel")"
     log_info "Image: $IMAGE_REPO:$version"
 
-    local creds=""
-    creds="$(render_env "$db_kind" "$version")"
+    render_env "$db_kind" "$version"
     render_compose "$db_kind"
-    if [[ "$db_kind" != "sqlite" ]]; then
-        render_db_secrets \
-            "$(printf '%s\n' "$creds" | grep '^DB_PORT=' | cut -d= -f2-)" \
-            "$(printf '%s\n' "$creds" | grep '^DB_USER=' | cut -d= -f2-)" \
-            "$(printf '%s\n' "$creds" | grep '^DB_PASSWORD=' | cut -d= -f2-)" \
-            "$(printf '%s\n' "$creds" | grep '^DB_ROOT_PASSWORD=' | cut -d= -f2-)"
-        unset creds
-    fi
 
     log_step "Pulling images"
     compose pull
@@ -562,7 +678,9 @@ Next steps:
   2. Open the dashboard:            http://<server-ip>:$(env_get UVICORN_PORT)/dashboard/
      Zagros Ops dashboard:          http://<server-ip>:$(env_get UVICORN_PORT)/zagros/dashboard
      Config Studio:                 http://<server-ip>:$(env_get UVICORN_PORT)/zagros/studio
-  3. Install a core when needed:    zagros install-core <xray|sing-box|hysteria2|tuic|...>
+  3. Configure anything:            zagros config edit   (file: $ENV_FILE)
+     then apply it all:             zagros restart
+  4. Install a core when needed:    zagros install-core <xray|sing-box|hysteria2|tuic|...>
      (cores self-install their official binaries at runtime — nothing is
       baked into the image and no core has a special place)
 EOF
@@ -579,7 +697,7 @@ zagros install — one-command installation
 Examples:
   sudo bash -c "\$(curl -fsSL $SCRIPTS_REPO_RAW/main/zagros.sh)" -- install
   zagros install --database postgresql
-  zagros install --database mysql --version v1.0.0-alpha.3
+  zagros install --database mysql --version v1.0.0-alpha.4
 EOF
 }
 
@@ -733,11 +851,19 @@ cmd_down()    { require_root; require_installed; compose down; log_ok "zagros do
 cmd_start()   { require_root; require_installed; compose start; wait_healthy "$SERVICE" 120 \
                 && log_ok "started ($(panel_version))" || die "failed to start healthy — zagros logs"; }
 cmd_stop()    { require_root; require_installed; compose stop; log_ok "stopped"; }
-cmd_restart() { require_root; require_installed; compose restart; wait_healthy "$SERVICE" 120 \
-                && log_ok "restarted ($(panel_version))" || die "restart unhealthy — zagros logs"; }
+cmd_restart() { require_root; require_installed
+    # Marzban-parity contract (and stronger): `zagros restart` ALWAYS
+    # applies .env. A recreate — not a bare `compose restart` — because a
+    # file-level bind mount keeps the old inode when the file was replaced
+    # by an editor/rename; recreating re-resolves ./.env deterministically.
+    log_step "Restart (recreate panel — applies .env)"
+    compose up -d --force-recreate "$SERVICE" >/dev/null
+    wait_healthy "$SERVICE" 150 \
+        && log_ok "restarted, configuration applied ($(panel_version))" \
+        || die "restart unhealthy — zagros logs"; }
 cmd_reload()  {
     require_root; require_installed
-    log_step "Reload (recreate panel container)"
+    log_step "Reload (same as restart: recreate panel — applies .env)"
     compose up -d --force-recreate "$SERVICE" >/dev/null
     wait_healthy "$SERVICE" 150 && log_ok "reloaded ($(panel_version))" \
         || die "reload unhealthy — zagros logs"
@@ -772,7 +898,16 @@ cmd_status() {
     printf '  %-22s %s\n' "image:" "$IMAGE_REPO:${tag:-unknown}"
     printf '  %-22s %s\n' "health:" "$health_status"
     printf '  %-22s %s\n' "database:" "$(env_get ZAGROS_DB_KIND)"
-    printf '  %-22s http://%s:%s\n' "panel:" "0.0.0.0" "$(env_get UVICORN_PORT)"
+    printf '  %-22s %s\n' "config file:" "$ENV_FILE"
+    local host port base
+    host="$(env_get UVICORN_HOST)"; host="${host:-0.0.0.0}"
+    port="$(env_get UVICORN_PORT)"; port="${port:-8000}"
+    base="$(env_get PANEL_BASE_URL)"
+    if [[ -z "$base" ]]; then
+        local dom; dom="$(env_get DOMAIN)"
+        [[ -n "$dom" ]] && base="https://$dom"
+    fi
+    printf '  %-22s http://%s:%s%s\n' "panel bind:" "$host" "$port" "${base:+  (public: $base)}"
     docker ps --filter "name=zagros" --format 'table {{.Names}}\t{{.Status}}\t{{.Image}}' | sed 's/^/  /'
     if command -v jq >/dev/null 2>&1 && [[ "$health_status" == "healthy" ]]; then
         local cores
@@ -835,7 +970,7 @@ do_backup() {  # do_backup [--logs|--no-logs] → echoes archive path
         mysql|mariadb)
             port="$(env_get ZAGROS_DB_PORT)"
             local root_pw
-            root_pw="$(grep -oE 'MYSQL_ROOT_PASSWORD: .*' "$COMPOSE_FILE" | head -1 | cut -d' ' -f2-)"
+            root_pw="$(env_get ZAGROS_DB_ROOT_PASSWORD)"
             docker exec -e MYSQL_PWD="$root_pw" "$DB_SERVICE" \
                 mysqldump -h127.0.0.1 --port="$port" -uroot --single-transaction --routines --triggers \
                 --databases zagros zagros_legacy > "$staging/db/databases.sql" \
@@ -854,8 +989,10 @@ do_backup() {  # do_backup [--logs|--no-logs] → echoes archive path
             ;;
     esac
 
-    # 2. configuration & runtime state
-    cp -a "$ENV_FILE" "$staging/config/zagros.env"
+    # 2. configuration & runtime state (the .env is THE config; legacy
+    #    archives from pre-alpha.4 CLIs stored it as config/zagros.env —
+    #    restore_apply accepts both layouts)
+    cp -a "$ENV_FILE" "$staging/config/.env"
     cp -a "$COMPOSE_FILE" "$staging/config/docker-compose.yml"
     [[ -d "$STATE_DIR" ]] && cp -a "$STATE_DIR" "$staging/config/.state" || true
 
@@ -1010,8 +1147,35 @@ restore_apply() {  # restore_apply <staging> <db_kind> → 0/1
     local staging="$1" db_kind="$2" port
     compose stop >/dev/null 2>&1 || true
 
-    cp -a "$staging/config/zagros.env" "$ENV_FILE" || return 1
+    # configuration: current archives carry config/.env — the single
+    # source of truth. Legacy (pre-alpha.4) archives stored zagros.env
+    # instead; restore it INTO .env (on-the-fly migration).
+    if [[ -f "$staging/config/.env" ]]; then
+        cp -a "$staging/config/.env" "$ENV_FILE" || return 1
+    elif [[ -f "$staging/config/zagros.env" ]]; then
+        cp -a "$staging/config/zagros.env" "$ENV_FILE" || return 1
+        log_info "legacy backup (zagros.env) — configuration restored into .env"
+    else
+        log_err "archive contains no configuration (.env / zagros.env)"
+        return 1
+    fi
+    chmod 600 "$ENV_FILE" 2>/dev/null || true
     cp -a "$staging/config/docker-compose.yml" "$COMPOSE_FILE" || true
+
+    # A legacy archive also stored an injection-style compose (env_file +
+    # credentials baked in). Normalize it to the mount-only design:
+    # recover the db root password from the archived compose into .env,
+    # then regenerate the compose from the current template.
+    if ! grep -q '/code/.env' "$COMPOSE_FILE" 2>/dev/null; then
+        log_info "legacy compose detected — converting to the mount-only .env design"
+        local legacy_root
+        legacy_root="$(grep -oE 'MYSQL_ROOT_PASSWORD: .*' "$COMPOSE_FILE" 2>/dev/null | head -1 | cut -d' ' -f2- || true)"
+        if [[ -n "$legacy_root" && "$db_kind" =~ ^(mysql|mariadb)$ ]] \
+            && ! grep -qE '^ZAGROS_DB_ROOT_PASSWORD=.' "$ENV_FILE"; then
+            env_set ZAGROS_DB_ROOT_PASSWORD "$legacy_root"
+        fi
+        render_compose "$db_kind"
+    fi
     [[ -d "$staging/config/.state" ]] && { rm -rf "$STATE_DIR"; cp -a "$staging/config/.state" "$STATE_DIR"; } || true
 
     if [[ -f "$staging/data/panel-data.tar.gz" ]]; then
@@ -1030,7 +1194,7 @@ restore_apply() {  # restore_apply <staging> <db_kind> → 0/1
             wait_healthy "$DB_SERVICE" 150 || { log_err "db service not healthy"; return 1; }
             port="$(env_get ZAGROS_DB_PORT)"
             local root_pw
-            root_pw="$(grep -oE 'MYSQL_ROOT_PASSWORD: .*' "$COMPOSE_FILE" | head -1 | cut -d' ' -f2-)"
+            root_pw="$(env_get ZAGROS_DB_ROOT_PASSWORD)"
             provision_legacy_db
             docker exec -i -e MYSQL_PWD="$root_pw" "$DB_SERVICE" \
                 mysql -h127.0.0.1 --port="$port" -uroot < "$staging/db/databases.sql" || return 1
@@ -1160,12 +1324,33 @@ cmd_doctor() {
     fi
 
     # --- env sanity
+    dr_kv "env file" "$ENV_FILE (mounted read-only at /code/.env — edits apply via zagros restart)"
     local secret dburl
     secret="$(env_get ZAGROS_SECRET_KEY)"
     ((${#secret} >= 32)) && dr OK "ZAGROS_SECRET_KEY" "set (${#secret} chars)" \
         || dr FAIL "ZAGROS_SECRET_KEY" "missing/too short in $ENV_FILE"
     dburl="$(env_get ZAGROS_DATABASE_URL)"
     [[ -n "$dburl" ]] && dr OK "ZAGROS_DATABASE_URL" "${dburl%%://*}://…" || dr FAIL "ZAGROS_DATABASE_URL" "missing"
+
+    # --- TLS mode + certificate files
+    local tls_mode certf keyf
+    tls_mode="$(env_get TLS_MODE)"; tls_mode="${tls_mode:-auto}"
+    if [[ "$tls_mode" =~ ^(auto|on|off)$ ]]; then
+        dr OK "TLS_MODE" "$tls_mode"
+    else
+        dr FAIL "TLS_MODE" "invalid value '$tls_mode' (expected auto|on|off) — panel will refuse to boot"
+    fi
+    certf="$(env_get UVICORN_SSL_CERTFILE)"; keyf="$(env_get UVICORN_SSL_KEYFILE)"
+    if [[ "$tls_mode" == "on" && ( -z "$certf" || -z "$keyf" ) ]]; then
+        dr FAIL "TLS files" "TLS_MODE=on but cert/key not set in $ENV_FILE — panel will refuse to boot"
+    elif [[ -n "$certf" || -n "$keyf" ]]; then
+        if [[ -n "$certf" && -n "$keyf" && -f "$certf" && -f "$keyf" ]]; then
+            dr OK "TLS files" "cert+key present ($certf)"
+        else
+            # data dir is bind-mounted 1:1, so host paths match container paths
+            dr FAIL "TLS files" "cert/key missing or unreadable (cert='$certf' key='$keyf')"
+        fi
+    fi
 
     # --- database + migration + panel internals
     local dbc
@@ -1341,10 +1526,12 @@ dr_log() { printf '%s\n' "$*"; }
 # ----------------------------------------------------------------- config ---#
 cmd_config() {
     require_installed
-    local action="${1:-list}"; shift || true
+    local action="${1:-show}"; shift || true
     case "$action" in
         path) printf '%s\n' "$ENV_FILE" ;;
-        list)
+        list|show)
+            # `show` is the canonical verb (Marzban-style); `list` is kept
+            # as an alias for muscle memory. Secrets are always masked.
             while IFS= read -r line; do
                 [[ "$line" =~ ^#|^$ ]] && continue
                 local key="${line%%=*}" val="${line#*=}"
@@ -1368,7 +1555,7 @@ cmd_config() {
                 die "refusing to rotate ZAGROS_SECRET_KEY while a database exists (it decrypts stored credentials). Re-check with --force only if you know the consequences."
             fi
             env_set "$key" "$value"
-            log_ok "$key set"
+            log_ok "$key set (in $ENV_FILE)"
             if (( restart )) || confirm "Restart panel to apply?"; then cmd_restart; fi
             ;;
         edit)
@@ -1376,14 +1563,26 @@ cmd_config() {
             ${EDITOR:-vi} "$ENV_FILE"
             confirm "Restart panel to apply changes?" && cmd_restart || true
             ;;
+        reload)
+            require_root
+            cmd_config validate >/dev/null
+            log_step "Reloading configuration (recreate panel → re-reads .env)"
+            cmd_restart
+            ;;
         validate)
-            local fails=0 secret port
+            local fails=0 secret port tls_mode
             secret="$(env_get ZAGROS_SECRET_KEY)"
             ((${#secret} >= 16)) || { log_err "ZAGROS_SECRET_KEY < 16 chars"; fails=1; }
             port="$(env_get UVICORN_PORT)"
             [[ "$port" =~ ^[0-9]+$ && "$port" -ge 1 && "$port" -le 65535 ]] || { log_err "UVICORN_PORT invalid: $port"; fails=1; }
             [[ -n "$(env_get ZAGROS_DATABASE_URL)" ]] || { log_err "ZAGROS_DATABASE_URL missing"; fails=1; }
             [[ -n "$(env_get SQLALCHEMY_DATABASE_URL)" ]] || { log_err "SQLALCHEMY_DATABASE_URL missing"; fails=1; }
+            tls_mode="$(env_get TLS_MODE)"; tls_mode="${tls_mode:-auto}"
+            [[ "$tls_mode" =~ ^(auto|on|off)$ ]] || { log_err "TLS_MODE invalid: $tls_mode (auto|on|off)"; fails=1; }
+            if [[ "$tls_mode" == "on" ]]; then
+                [[ -n "$(env_get UVICORN_SSL_CERTFILE)" && -n "$(env_get UVICORN_SSL_KEYFILE)" ]] \
+                    || { log_err "TLS_MODE=on requires UVICORN_SSL_CERTFILE and UVICORN_SSL_KEYFILE"; fails=1; }
+            fi
             if grep -qE '^SQLALCHEMY_DATABASE_URL=sqlite' "$ENV_FILE" && grep -qE '^ZAGROS_DATABASE_URL=sqlite' "$ENV_FILE"; then
                 if [[ "$(env_get SQLALCHEMY_DATABASE_URL)" == "$(env_get ZAGROS_DATABASE_URL)" ]]; then
                     log_err "P3 and legacy SQLite URLs point to the SAME file (schema collision) — they must differ"; fails=1
@@ -1391,7 +1590,7 @@ cmd_config() {
             fi
             (( fails == 0 )) && log_ok "configuration valid" || die "configuration invalid"
             ;;
-        *) die "usage: zagros config [list|get|set|edit|validate|path]" ;;
+        *) die "usage: zagros config [show|list|get|set|edit|reload|validate|path]" ;;
     esac
 }
 
@@ -1651,9 +1850,10 @@ Usage: zagros <command> [options]
 Service lifecycle:
   install                 one-command install (--database sqlite|mysql|mariadb|postgresql)
   update                  pre-backup → pull image → migrate → health (auto-rollback on failure)
-  start / stop / restart  classic service control
+  start / stop / restart  service control — restart recreates the panel and
+                          ALWAYS applies .env edits (Marzban-style contract)
   up / down               docker compose up -d / down
-  reload                  recreate the panel container
+  reload                  recreate the panel container (same as restart)
   status                  service, image, health and core table
   logs [svc] [--tail N] [--no-follow]
   version                 CLI, image, panel and latest-release versions
@@ -1684,8 +1884,15 @@ Admin:
   create-admin [--username U] [--password P] [--sudo]
   reset-admin  [--username U] [--password P]
 
-Configuration & shell:
-  config [list|get|set|edit|validate|path]
+Configuration (.env is the single source of truth):
+  config                  show the effective config (masked secrets) [default]
+  config show | list      same as above
+  config get KEY          print one value
+  config set KEY VALUE    write one value in place [--force] [--restart]
+  config edit             open .env in \$EDITOR, then restart to apply
+  config reload           validate + restart (applies .env immediately)
+  config validate         sanity-check the .env
+  config path             print the .env location (/opt/zagros/.env)
   shell                   exec into the panel container
   uninstall [--purge] [--yes]
 
@@ -1697,6 +1904,9 @@ EOF
 main() {
     local cmd="${1:-help}"
     [[ $# -gt 0 ]] && shift || true
+    # Auto-migrate a legacy zagros.env → .env before ANY command touches the
+    # configuration (idempotent, never fatal when not writable).
+    migrate_env_file
     case "$cmd" in
         install)          cmd_install "$@" ;;
         uninstall)        cmd_uninstall "$@" ;;
