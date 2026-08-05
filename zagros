@@ -285,7 +285,7 @@ services:
       - __DATA_DIR__:/var/lib/zagros
     healthcheck:
       # no env injection → the probe reads UVICORN_PORT from the mounted file
-      test: ["CMD", "python3", "-c", "import urllib.request;p=next((l.split('=',1)[1].strip().strip(chr(34)).strip(chr(39)) for l in open('/code/.env',encoding='utf-8') if l.strip().startswith('UVICORN_PORT=')),'8000');urllib.request.urlopen('http://127.0.0.1:'+str(int(p))+'/zagros/dashboard',timeout=3).close()"]
+      test: ["CMD", "python3", "-c", "import urllib.request;p=next((l.split('=',1)[1].strip().strip(chr(34)).strip(chr(39)) for l in open('/code/.env',encoding='utf-8') if l.split('=',1)[0].strip()=='UVICORN_PORT'),'8000');urllib.request.urlopen('http://127.0.0.1:'+str(int(p))+'/zagros/dashboard',timeout=3).close()"]
       interval: 20s
       timeout: 8s
       retries: 6
