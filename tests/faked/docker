@@ -391,6 +391,14 @@ def record_image(image_repo: str, tag: str) -> None:
     save("images.json", images)
 
 
+def record_object(kind: str, name: str) -> None:
+    """Track non-container docker objects (volumes/networks)."""
+    objs = load(f"{kind}.json", [])
+    if name not in objs:
+        objs.append(name)
+        save(f"{kind}.json", objs)
+
+
 def handle_compose(rest: list[str]) -> "None":
     sub, tail, env_file, _compose_file = parse_compose_args(rest)
     if sub == "version":
@@ -519,6 +527,10 @@ def main() -> "None":
                 continue
             if fmt == "{{.Repository}}:{{.Tag}} {{.Digest}}":
                 out(f"{r}:{t} {digest}")
+            elif fmt == "{{.Repository}}:{{.Tag}}":
+                out(f"{r}:{t}")
+            elif fmt == "{{.Repository}}":
+                out(r)
             elif fmt == "{{.Tag}}":
                 out(t)
             elif "-q" in argv:
@@ -564,9 +576,12 @@ def main() -> "None":
             out(r)
         sys.exit(0)
     if a0 in ("stop", "start", "rm"):
-        for name in argv[1:]:
-            if name.startswith("-"):
-                continue
+        all_flag = "-a" in argv or "--all" in argv
+        names = [n for n in argv[1:] if not n.startswith("-") and n != "$(cat)"]
+        if a0 == "rm" and all_flag and not names:
+            # `docker rm -a`-style callers sweep everything
+            names = list(containers().keys())
+        for name in names:
             if a0 == "stop":
                 set_container(name, False)
             elif a0 == "start":
@@ -582,16 +597,17 @@ def main() -> "None":
         sys.exit(0)
     if a0 == "rmi":
         images = load("images.json", {})
-        rc = 0
-        for ref in argv[1:]:
-            if ref.startswith("-"):
-                continue
-            if ref in images:
-                images.pop(ref)
-            elif ref:
-                rc = 0  # idempotent like `|| true` callers expect
+        repo, _, tag = "", "", ""
+        # `docker rmi <repo>` (no tag) removes ALL tags of that repo
+        refs = [r for r in argv[1:] if not r.startswith("-")]
+        for ref in refs:
+            if ":" in ref:
+                images.pop(ref, None)
+            else:
+                for k in [k for k in images if k.split(":")[0] == ref]:
+                    images.pop(k)
         save("images.json", images)
-        sys.exit(rc)
+        sys.exit(0)
     if a0 == "exec":
         # direct exec (db dumps / provisioning): flags before container name
         i = 1
@@ -620,11 +636,56 @@ def main() -> "None":
             pass
         sys.exit(0)
     if a0 == "run":
+        # register the container like real docker would (name via --name)
+        name = next((argv[i + 1] for i, a in enumerate(argv) if a == "--name" and i + 1 < len(argv)), None)
+        if name:
+            set_container(name, True, False)
         sys.exit(0)
     if a0 == "system":
         out("Total reclaimed space: 0B")
         sys.exit(0)
+    if a0 == "volume":
+        sub = argv[1] if len(argv) > 1 else ""
+        objs = load("volumes.json", [])
+        if sub == "create":
+            name = argv[-1]
+            if name not in objs:
+                objs.append(name); save("volumes.json", objs)
+            out(name)
+            sys.exit(0)
+        if sub == "ls":
+            fmt = argv[argv.index("--format") + 1] if "--format" in argv else ""
+            for v in objs:
+                out(v if fmt else f"local {v}")
+            sys.exit(0)
+        if sub in ("rm", "remove"):
+            for v in argv[2:]:
+                if v.startswith("-") or v == "rm":
+                    continue
+                if v in objs:
+                    objs.remove(v)
+            save("volumes.json", objs)
+            sys.exit(0)
+        sys.exit(0)
     if a0 == "network":
+        sub = argv[1] if len(argv) > 1 else ""
+        objs = load("networks.json", ["bridge", "host", "none"])
+        if sub == "create":
+            name = argv[-1]
+            if name not in objs:
+                objs.append(name); save("networks.json", objs)
+            sys.exit(0)
+        if sub == "ls":
+            fmt = argv[argv.index("--format") + 1] if "--format" in argv else ""
+            for n in objs:
+                out(n if fmt else f"NETWORK {n}")
+            sys.exit(0)
+        if sub in ("rm", "remove"):
+            for n in argv[2:]:
+                if n in objs and n not in ("bridge", "host", "none"):
+                    objs.remove(n)
+            save("networks.json", objs)
+            sys.exit(0)
         sys.exit(0)
     # unknown subcommands: succeed quietly (harness lenient by design)
     sys.exit(0)

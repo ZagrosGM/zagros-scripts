@@ -27,11 +27,13 @@ export ZAGROS_HOME="$T/opt/zagros"
 export ZAGROS_DATA="$T/var/lib/zagros"
 export ZAGROS_BIN="$T/bin"
 export FAKE_DOCKER_STATE="$T/faked-state"
+export ZAGROS_ETC="$T/etc/zagros"
 export NO_COLOR=1
 export ASSUME_YES=1
 export PATH="$REPO_ROOT/tests/faked:$PATH"
 
 CLI="$REPO_ROOT/zagros"
+IMAGE_REPO="ghcr.io/zagrosgm/zagros"
 SH="$REPO_ROOT/zagros.sh"
 
 PASS=0; FAIL=0; FAILED_NAMES=()
@@ -376,18 +378,23 @@ grep -q '^ZAGROS_SECRET_KEY=' "$ZAGROS_HOME/.env" \
 sed -i "1i $SECRET_LINE" "$ZAGROS_HOME/.env"
 
 # ----------------------------------------------------------------------------- #
-say "t16 uninstall (soft) then reinstall + purge"
+say "t16 full uninstall — single command wipes EVERYTHING (no --purge anymore)"
+run bash "$CLI" uninstall --purge --yes
+expect_rc "--purge flag rejected (removed contract)" 1
+grep -q "no such option" <<<"$LAST_OUT" \
+    && ok "--purge removal explained" || bad "--purge removal explained" "$LAST_OUT"
+
 run bash "$CLI" uninstall --yes
 expect_rc "uninstall rc0" 0
 expect_no_file "$ZAGROS_HOME/docker-compose.yml" "service dir removed"
+expect_no_file "$ZAGROS_HOME" "opt tree fully removed"
 expect_no_file "$ZAGROS_BIN/zagros" "CLI binary removed"
-expect_file "$ZAGROS_DATA" "data dir kept without --purge"
+expect_no_file "$ZAGROS_DATA" "data dir fully removed (no more soft uninstall)"
 
 run bash "$CLI" install
 expect_rc "reinstall rc0" 0
-run bash "$CLI" uninstall --purge --yes
-expect_rc "purge uninstall rc0" 0
-expect_no_file "$ZAGROS_DATA" "data purged"
+run bash "$CLI" uninstall --yes
+expect_rc "second full uninstall rc0" 0
 
 # ----------------------------------------------------------------------------- #
 say "t17 one-liner idempotency: CLI already living at ZAGROS_BIN"
@@ -411,7 +418,7 @@ expect_out "restore completes without ASSUME_YES" "restore complete"
 run env -u ASSUME_YES bash "$ZAGROS_BIN/zagros" restore latest </dev/null
 expect_rc "restore without confirmation aborts" 1
 
-run bash "$ZAGROS_BIN/zagros" uninstall --purge --yes
+run bash "$ZAGROS_BIN/zagros" uninstall --yes
 expect_rc "cleanup purge rc0" 0
 
 # ----------------------------------------------------------------------------- #
@@ -469,7 +476,7 @@ grep -q './.env:/code/.env:ro' "$ZAGROS_HOME/docker-compose.yml" \
     && ok "compose normalized to the mount design" || bad "compose normalized to the mount design"
 grep -q 'env_file:' "$ZAGROS_HOME/docker-compose.yml" \
     && bad "no env_file injection left after normalize" || ok "no env_file injection left after normalize"
-run bash "$CLI" uninstall --purge --yes
+run bash "$CLI" uninstall --yes
 expect_rc "t19 cleanup rc0" 0
 
 # ----------------------------------------------------------------------------- #
@@ -492,8 +499,76 @@ grep -q 'env_file:' "$ZAGROS_HOME/docker-compose.yml" \
     && bad "mysql stack: no env_file injection" || ok "mysql stack: no env_file injection"
 grep -q './.env:/code/.env:ro' "$ZAGROS_HOME/docker-compose.yml" \
     && ok "mysql stack: .env mounted" || bad "mysql stack: .env mounted"
-run bash "$CLI" uninstall --purge --yes
-expect_rc "t20 cleanup rc0" 0
+
+# ----------------------------------------------------------------------------- #
+say "t21 FULL UNINSTALL: every Zagros artifact wiped + verified (containers, images, volumes, networks, dirs, CLI)"
+
+# --- mysql stack: containers AND images (panel + db) must vanish
+run bash "$CLI" uninstall --yes
+expect_rc "mysql full uninstall rc0" 0
+expect_out "uninstall runs full docker sweep" "containers:"
+docker ps -a --format '{{.Names}}' | grep -q '^zagros' \
+    && bad "no zagros containers remain (mysql)" "$(docker ps -a --format '{{.Names}}')" \
+    || ok "no zagros containers remain (mysql)"
+docker images "$IMAGE_REPO" --format '{{.Repository}}:{{.Tag}}' | grep -q . \
+    && bad "panel images removed (mysql)" || ok "panel images removed (mysql)"
+docker images --format '{{.Repository}}' | grep -qE '^(mysql|mariadb|postgres)$' \
+    && bad "db images removed (mysql)" || ok "db images removed (mysql)"
+expect_no_file "$ZAGROS_HOME" "opt tree gone (mysql)"
+expect_no_file "$ZAGROS_DATA" "data tree gone incl. db files (mysql)"
+expect_no_file "$ZAGROS_BIN/zagros" "CLI gone (mysql)"
+
+# --- sqlite stack with installed cores + backups + stray leftovers
+reset_fake
+rm -rf "$ZAGROS_HOME"
+run bash "$CLI" install
+expect_rc "sqlite reinstall rc0" 0
+run bash "$CLI" install-core sing-box
+expect_rc "install a core (adds binaries + logs under data)" 0
+run bash "$CLI" backup
+expect_rc "backup creates artifacts under data/backups" 0
+expect_file "$ZAGROS_DATA/backups" "backup dir exists pre-uninstall"
+# strays the installer never tracked but a full uninstall must still sweep:
+mkdir -p "$ZAGROS_DATA/stray" "$T/etc/zagros"
+echo stray > "$ZAGROS_DATA/stray/left.db"
+echo legacy > "$T/etc/zagros/legacy.conf"
+docker volume create zagros-strayvol >/dev/null
+docker network create zagros-straynet >/dev/null
+docker run --name zagros-stray orphan:image >/dev/null
+run bash "$CLI" uninstall --yes
+expect_rc "full uninstall rc0 (sqlite, leftovers seeded)" 0
+expect_out "removal summary printed" "containers:"
+expect_out "removal summary printed" "images:"
+expect_out "removal summary printed" "volumes:"
+expect_out "removal summary printed" "networks:"
+expect_out "removal summary printed" "databases"
+expect_out "removal summary printed" "certificates"
+expect_out "removal summary printed" "backups"
+expect_out "removal summary printed" "logs"
+# docker surface must be spotless
+docker ps -a --format '{{.Names}}' | grep -q '^zagros' \
+    && bad "no zagros containers remain (sqlite)" "$(docker ps -a --format '{{.Names}}')" \
+    || ok "no zagros containers remain (sqlite)"
+docker images "$IMAGE_REPO" --format '{{.Repository}}:{{.Tag}}' | grep -q . \
+    && bad "panel images removed (sqlite)" || ok "panel images removed (sqlite)"
+docker volume ls --format '{{.Name}}' | grep -q '^zagros' \
+    && bad "no zagros volumes remain" "$(docker volume ls --format '{{.Name}}')" \
+    || ok "no zagros volumes remain"
+docker network ls --format '{{.Name}}' | grep -q '^zagros' \
+    && bad "no zagros networks remain" "$(docker network ls --format '{{.Name}}')" \
+    || ok "no zagros networks remain"
+# filesystem must be spotless
+expect_no_file "$ZAGROS_HOME" "opt tree gone (sqlite)"
+expect_no_file "$ZAGROS_DATA" "data tree gone incl. stray file (sqlite)"
+expect_no_file "$T/etc/zagros" "etc tree gone"
+expect_no_file "$ZAGROS_BIN/zagros" "CLI gone (sqlite)"
+
+# --- reinstall is truly clean (no leftovers break a fresh install)
+run bash "$CLI" install
+expect_rc "post-uninstall reinstall rc0" 0
+expect_file "$ZAGROS_HOME/.state/install.json" "fresh install state recorded"
+run bash "$CLI" uninstall --yes >/dev/null
+expect_rc "final cleanup rc0" 0
 
 # ----------------------------------------------------------------------------- #
 printf '\n==============================================================\n'

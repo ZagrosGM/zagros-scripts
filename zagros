@@ -24,7 +24,7 @@
 # =============================================================================
 set -euo pipefail
 
-ZAGROS_CLI_VERSION="1.0.0-alpha.5"
+ZAGROS_CLI_VERSION="1.0.0-alpha.6"
 SCRIPTS_REPO_RAW="https://raw.githubusercontent.com/ZagrosGM/zagros-scripts"
 PANEL_REPO="ZagrosGM/Zagros"
 PANEL_API="https://api.github.com/repos/${PANEL_REPO}"
@@ -33,6 +33,8 @@ IMAGE_REPO="ghcr.io/zagrosgm/zagros"
 ZAGROS_HOME="${ZAGROS_HOME:-/opt/zagros}"
 ZAGROS_DATA="${ZAGROS_DATA:-/var/lib/zagros}"
 ZAGROS_BIN="${ZAGROS_BIN:-/usr/local/bin}"
+# Config leftovers outside the managed dirs (overridable for tests).
+ZAGROS_ETC="${ZAGROS_ETC:-/etc/zagros}"
 ZAGROS_SCRIPTS_REF="${ZAGROS_SCRIPTS_REF:-main}"
 COMPOSE_FILE="$ZAGROS_HOME/docker-compose.yml"
 # Configuration contract: ONE .env file is the single source of truth.
@@ -696,38 +698,148 @@ zagros install — one-command installation
 Examples:
   sudo bash -c "\$(curl -fsSL $SCRIPTS_REPO_RAW/main/zagros.sh)" -- install
   zagros install --database postgresql
-  zagros install --database mysql --version v1.0.0-alpha.5
+  zagros install --database mysql --version v1.0.0-alpha.6
 EOF
 }
 
 # -------------------------------------------------------------- uninstall ---#
+# Full uninstall — the ONLY mode. There is no --purge anymore: `zagros
+# uninstall` wipes every trace of Zagros (containers, images, volumes,
+# networks, /opt, /var/lib, /etc, CLI) and then VERIFIES nothing is left.
+uninstall_summary() {
+    # One honest pre-flight list of what will be destroyed.
+    local containers images volumes networks
+    containers=$(docker ps -a --format '{{.Names}}' 2>/dev/null | grep -c '^zagros' || true)
+    images=$(docker images --format '{{.Repository}}' 2>/dev/null \
+        | grep -cE "^(ghcr\.io/zagrosgm/zagros|mysql|mariadb|postgres)$" || true)
+    volumes=$(docker volume ls --format '{{.Name}}' 2>/dev/null | grep -c '^zagros' || true)
+    networks=$(docker network ls --format '{{.Name}}' 2>/dev/null | grep -c '^zagros' || true)
+    cat <<EOF
+The following will be PERMANENTLY destroyed (full uninstall):
+  containers:    ${containers:-0} (zagros, zagros-db, any zagros-*)
+  images:        ${images:-0} (panel: $IMAGE_REPO, db: mysql/mariadb/postgres)
+  volumes:       ${volumes:-0} (any zagros-* docker volume)
+  networks:      ${networks:-0} (any zagros-* docker network)
+  databases:     SQLite file(s) and MySQL/PostgreSQL data dirs under $ZAGROS_DATA
+  configurations: $ZAGROS_HOME (compose file, .env, generated configs) and /etc/zagros
+  certificates:  TLS keys and certs under $ZAGROS_DATA
+  runtime data:  cores, inbounds settings, subscription payloads under $ZAGROS_DATA
+  logs:          panel + core logs under $ZAGROS_DATA
+  backups:       $ZAGROS_DATA/backups (all backup archives)
+  CLI:           $ZAGROS_BIN/zagros
+Afterwards the system must look like Zagros was never installed.
+EOF
+}
+
+uninstall_docker_sweep() {
+    log_step "docker sweep (containers, images, volumes, networks)"
+    # 1. graceful stack shutdown first (removes tracked vols/nets), then strict sweep
+    if [[ -f "$COMPOSE_FILE" ]]; then
+        compose_probe; "${COMPOSE[@]}" -f "$COMPOSE_FILE" --env-file "$ENV_FILE" \
+            down --remove-orphans --volumes 2>/dev/null \
+            || log_warn "compose down reported errors (continuing with strict sweep)"
+    fi
+    # 2. containers: anything named zagros* (panel, db, strays from older alphas)
+    local c
+    while read -r c; do
+        [[ -n "$c" ]] || continue
+        docker rm -f "$c" >/dev/null 2>&1 || log_warn "could not remove container: $c"
+    done < <(docker ps -a --format '{{.Names}}' 2>/dev/null | grep '^zagros' || true)
+    # 3. images: every panel image (+ db images we provisioned)
+    local i
+    while read -r i; do
+        [[ -n "$i" ]] || continue
+        docker rmi -f "$i" >/dev/null 2>&1 || true
+    done < <(docker images "$IMAGE_REPO" --format '{{.Repository}}:{{.Tag}}' 2>/dev/null || true)
+    while read -r i; do
+        [[ -n "$i" ]] || continue
+        # db tags we create ourselves (postgres/mysql/mariadb pinned by installer)
+        docker rmi -f "$i" >/dev/null 2>&1 || true
+    done < <(docker images --format '{{.Repository}}:{{.Tag}}' 2>/dev/null | grep -E '^(mysql|mariadb|postgres):' || true)
+    # 4. volumes (named leftovers — compose volumes and manual strays)
+    local v
+    while read -r v; do
+        [[ -n "$v" ]] || continue
+        docker volume rm -f "$v" >/dev/null 2>&1 || log_warn "could not remove volume: $v"
+    done < <(docker volume ls --format '{{.Name}}' 2>/dev/null | grep '^zagros' || true)
+    # 5. networks (never touch bridge/host/none)
+    local n
+    while read -r n; do
+        [[ -n "$n" ]] || continue
+        docker network rm "$n" >/dev/null 2>&1 || true
+    done < <(docker network ls --format '{{.Name}}' 2>/dev/null | grep '^zagros' || true)
+}
+
+uninstall_filesystem_sweep() {
+    log_step "filesystem sweep (/opt, /var/lib, /etc, CLI)"
+    rm -rf "$ZAGROS_HOME"   # compose file, .env, state, generated configs
+    rm -rf "$ZAGROS_DATA"   # databases (sqlite/mysql/postgres files), cores,
+                            # certificates, TLS keys, runtime data, logs, backups, cache
+    rm -rf "$ZAGROS_ETC"     # legacy/config leftovers where present
+    rm -f  "$ZAGROS_BIN/zagros"
+    log_ok "removed $ZAGROS_HOME, $ZAGROS_DATA, /etc/zagros and the CLI"
+}
+
+uninstall_verify() {
+    log_step "verifying nothing is left"
+    local leftovers=() found
+    found=$(docker ps -a --format '{{.Names}}' 2>/dev/null | grep '^zagros' || true)
+    [[ -n "$found" ]] && leftovers+=("containers: $(tr '\n' ' ' <<<"$found")")
+    found=$(docker images --format '{{.Repository}}' 2>/dev/null \
+        | grep -E "^(ghcr\.io/zagrosgm/zagros|mysql|mariadb|postgres)$" || true)
+    [[ -n "$found" ]] && leftovers+=("images: $(tr '\n' ' ' <<<"$found")")
+    found=$(docker volume ls --format '{{.Name}}' 2>/dev/null | grep '^zagros' || true)
+    [[ -n "$found" ]] && leftovers+=("volumes: $(tr '\n' ' ' <<<"$found")")
+    found=$(docker network ls --format '{{.Name}}' 2>/dev/null | grep '^zagros' || true)
+    [[ -n "$found" ]] && leftovers+=("networks: $(tr '\n' ' ' <<<"$found")")
+    [[ -e "$ZAGROS_HOME" ]] && leftovers+=("$ZAGROS_HOME")
+    [[ -e "$ZAGROS_DATA" ]] && leftovers+=("$ZAGROS_DATA")
+    [[ -e "$ZAGROS_ETC" ]] && leftovers+=("$ZAGROS_ETC")
+    [[ -e "$ZAGROS_BIN/zagros" ]] && leftovers+=("$ZAGROS_BIN/zagros")
+
+    if ((${#leftovers[@]})); then
+        log_warn "leftovers detected — forcing removal: ${leftovers[*]}"
+        local c v n i
+        while read -r c; do [[ -n "$c" ]] && docker rm -f "$c" >/dev/null 2>&1 || true; done \
+            < <(docker ps -a --format '{{.Names}}' 2>/dev/null | grep '^zagros' || true)
+        while read -r i; do [[ -n "$i" ]] && docker rmi -f "$i" >/dev/null 2>&1 || true; done \
+            < <(docker images --format '{{.Repository}}:{{.Tag}}' 2>/dev/null \
+                 | grep -E '^(ghcr\.io/zagrosgm/zagros|mysql|mariadb|postgres):' || true)
+        while read -r v; do [[ -n "$v" ]] && docker volume rm -f "$v" >/dev/null 2>&1 || true; done \
+            < <(docker volume ls --format '{{.Name}}' 2>/dev/null | grep '^zagros' || true)
+        while read -r n; do [[ -n "$n" ]] && docker network rm "$n" >/dev/null 2>&1 || true; done \
+            < <(docker network ls --format '{{.Name}}' 2>/dev/null | grep '^zagros' || true)
+        rm -rf "$ZAGROS_HOME" "$ZAGROS_DATA" "$ZAGROS_ETC"
+        rm -f "$ZAGROS_BIN/zagros"
+        # final re-check — honesty: fail loudly instead of claiming success
+        leftovers=()
+        [[ -e "$ZAGROS_HOME" ]] && leftovers+=("$ZAGROS_HOME")
+        [[ -e "$ZAGROS_DATA" ]] && leftovers+=("$ZAGROS_DATA")
+        [[ -e "$ZAGROS_ETC" ]] && leftovers+=("$ZAGROS_ETC")
+        [[ -e "$ZAGROS_BIN/zagros" ]] && leftovers+=("$ZAGROS_BIN/zagros")
+        [[ $(docker ps -a --format '{{.Names}}' 2>/dev/null | grep -c '^zagros' || true) == "0" ]] \
+            || leftovers+=("docker containers")
+        ((${#leftovers[@]})) && die "uninstall incomplete, still present: ${leftovers[*]} — remove manually and report."
+    fi
+    log_ok "verified: no Zagros containers, images, volumes, networks, dirs or CLI remain"
+}
+
 cmd_uninstall() {
-    local purge=0 yes=0
+    local yes=0
     while (($#)); do
         case "$1" in
-            --purge) purge=1; shift ;;
+            --purge) die "no such option: --purge — 'zagros uninstall' is ALWAYS a full uninstall now (data included)" ;;
             --yes|-y) yes=1; shift ;;
             *) die "unknown uninstall option: $1" ;;
         esac
     done
     require_root
-    (( yes )) || confirm "Remove Zagros services and $ZAGROS_HOME?" || die "aborted."
-    if [[ -f "$COMPOSE_FILE" ]]; then
-        compose_probe; "${COMPOSE[@]}" -f "$COMPOSE_FILE" --env-file "$ENV_FILE" \
-            down --remove-orphans || log_warn "compose down reported errors (continuing)"
-    fi
-    rm -rf "$ZAGROS_HOME"
-    rm -f  "$ZAGROS_BIN/zagros"
-    log_ok "removed $ZAGROS_HOME and the CLI"
-    if (( purge )); then
-        (( yes )) || confirm "ALSO delete ALL DATA under $ZAGROS_DATA (databases, cores, backups)?" || die "kept data; finished."
-        rm -rf "$ZAGROS_DATA"
-        docker rmi "$(docker images "$IMAGE_REPO" -q)" >/dev/null 2>&1 || true
-        log_ok "purged $ZAGROS_DATA and panel images"
-    else
-        log_info "data kept at $ZAGROS_DATA (use --purge to remove everything)"
-    fi
-    log_ok "Zagros uninstalled."
+    uninstall_summary
+    (( yes )) || confirm "Proceed with FULL uninstall (everything above will be destroyed)?" || die "aborted."
+    uninstall_docker_sweep
+    uninstall_filesystem_sweep
+    uninstall_verify
+    log_ok "Zagros fully uninstalled — the system is clean."
 }
 
 # ----------------------------------------------------------------- update ---#
@@ -1893,7 +2005,10 @@ Configuration (.env is the single source of truth):
   config validate         sanity-check the .env
   config path             print the .env location (/opt/zagros/.env)
   shell                   exec into the panel container
-  uninstall [--purge] [--yes]
+  uninstall [--yes]       FULL uninstall — containers, images, volumes,
+                          networks, /opt/zagros, /var/lib/zagros (databases,
+                          backups, certificates, logs), /etc/zagros and this CLI.
+                          Prints a removal summary and asks for confirmation.
 
 Everything runs against the REAL services — nothing is simulated.
 Docs: https://github.com/ZagrosGM/zagros-scripts

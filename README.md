@@ -15,7 +15,7 @@ and messages — nothing is simulated; and the stack is **core-agnostic**: no
 core binary is baked into the image, every core self-installs its official
 upstream release at runtime, and no core has a special place anywhere.
 
-> **Status: ALPHA** (`v1.0.0-alpha.5`). Suitable for evaluation and lab
+> **Status: ALPHA** (`v1.0.0-alpha.6`). Suitable for evaluation and lab
 > testing. The CLI's semantics are covered by an end-to-end test suite
 > (`tests/`, 189 assertions) and the in-container bridge by the panel's
 > pytest suite — read *Verification* below honestly before production use.
@@ -137,7 +137,7 @@ CLI cheatsheet: `zagros config show` (masked overview) ·
 | `logs [zagros\|zagros-db] [--tail N] [--no-follow]` | Service logs (follows by default). |
 | `shell` | `exec` into the panel container (`bash`, falls back to `sh`). |
 | `version` | CLI, image tag, panel version, newest release. |
-| `uninstall [--purge] [-y]` | Remove services + `/opt/zagros` + CLI; `--purge` also deletes `/var/lib/zagros` and panel images. |
+| `uninstall [-y]` | **Full uninstall** — destroys everything: containers, panel+DB images, volumes, networks, `/opt/zagros`, `/var/lib/zagros` (databases, backups, certificates, logs, runtime data), `/etc/zagros` and the CLI itself. Prints a removal summary first, then verifies nothing is left. |
 
 ### Operations
 
@@ -230,7 +230,7 @@ run `zagros backup` first regardless).
   `bash tests/test_cli.sh` — an end-to-end harness that drives the **real**
   CLI through 189 assertions (install → config → admin → cores → backup →
   restore → update → forced-failure rollback → doctor → repair → clean/prune
-  → uninstall/purge) against a faithful docker/compose/hostctl double
+  → full uninstall & verification) against a faithful docker/compose/hostctl double
   (`tests/faked/`). GitHub runners additionally run the real-VPS E2E below.
 * **Real-VPS E2E** (`e2e.yml`, `workflow_dispatch`): boots a fresh
   `ubuntu-latest` machine, runs the **real** one-liner install from GHCR,
