@@ -94,8 +94,11 @@ jobs:
             -d 'username=e2e-admin' --data-urlencode 'password=E2e-Test-Pass-1' \
             | python3 -c 'import json,sys; print(json.load(sys.stdin)["access_token"])')
           curl -fsS -H "Authorization: Bearer $TOKEN" "http://127.0.0.1:8000/api/system" -o /dev/null -w 'system API: %{http_code}\n'
+          # fresh install enables only the default shadowsocks inbound; asking
+          # for a protocol with no inbound is a REAL 400 (verified: "Protocol
+          # ProxyTypes.VLESS is disabled on your server")
           curl -fsS -X POST -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
-            -d '{"username":"e2e-user","proxies":{"vless":{}},"inbounds":{},"data_limit":1073741824}' \
+            -d '{"username":"e2e-user","proxies":{"shadowsocks":{}},"inbounds":{},"data_limit":1073741824}' \
             "http://127.0.0.1:8000/api/user" -o /dev/null -w 'create user: %{http_code}\n'
           curl -fsS -H "Authorization: Bearer $TOKEN" "http://127.0.0.1:8000/api/users?limit=10" \
             | grep -q 'e2e-user' && echo "user persists ✓" 
