@@ -128,7 +128,8 @@ expect_out "status shows panel" "database:"
 run bash "$CLI" health; expect_rc "health rc0" 0
 expect_out "health payload line" "healthy: db=sqlite"
 run bash "$CLI" version; expect_rc "version rc0" 0
-expect_out "version shows CLI" "zagros CLI     1.0.0-alpha.5"
+EXPECTED_CLI_VER=$(grep -m1 '^ZAGROS_CLI_VERSION=' "$CLI" | cut -d'"' -f2)
+expect_out "version shows CLI" "zagros CLI     $EXPECTED_CLI_VER"
 expect_out "version shows panel" "panel version"
 
 # ----------------------------------------------------------------------------- #
