@@ -29,9 +29,9 @@ const PASS = process.env.PANEL_PASS || "";
 const SOAK_SECS = Number(process.env.SOAK_SECS || 90);
 
 const PAGES = [
-  "/users", "/subscriptions", "/nodes", "/cores", "/routing", "/outbounds",
-  "/inbounds", "/dns", "/certificates", "/sessions", "/devices", "/logs",
-  "/marketplace", "/settings", "/advanced", "/",
+  "/users", "/admins", "/templates", "/subscriptions", "/nodes", "/cores",
+  "/routing", "/outbounds", "/inbounds", "/dns", "/certificates", "/sessions",
+  "/devices", "/logs", "/marketplace", "/settings", "/advanced", "/",
 ];
 
 const events = { pageerrors: [], consoleErrors: [], failedReqs: [] };
@@ -110,6 +110,65 @@ for (const p of PAGES) {
   if (await crashCard()) fail(`error boundary tripped on page ${p}`);
 }
 console.log(`5. all ${PAGES.length} pages render and stay alive`);
+
+// ---- 5b. modal overlay regression (alpha.7 spec item 10) ------------------ #/
+// The alpha.6 dialog rendered its backdrop as `absolute inset-0` inside a
+// scrollable container: opening "New User" left the lower half of the page
+// un-blacked and let the body scroll behind the modal. The rewrite portals a
+// FIXED full-viewport backdrop + locks body scroll — assert both here.
+await page.evaluate(() => { location.hash = "#/users"; });
+await page.waitForTimeout(1500);
+const newUserBtn = page.locator('main button:has-text("New User"), main button:has-text("کاربر جدید")').first();
+if (await newUserBtn.count()) {
+  await newUserBtn.click();
+  await page.waitForTimeout(900);
+  const overlay = await page.evaluate(() => {
+    const backdrop = [...document.querySelectorAll("div")].find((d) =>
+      d.className.includes("bg-black/55") && d.className.includes("fixed"));
+    if (!backdrop) return { ok: false, why: "no fixed backdrop found" };
+    const r = backdrop.getBoundingClientRect();
+    if (r.width < window.innerWidth - 1 || r.height < window.innerHeight - 1)
+      return { ok: false, why: `backdrop ${r.width}x${r.height} vs viewport ${window.innerWidth}x${window.innerHeight}` };
+    if (document.body.style.overflow !== "hidden")
+      return { ok: false, why: "body scroll NOT locked (overflow != hidden)" };
+    if (!document.querySelector('[role="dialog"]'))
+      return { ok: false, why: "role=dialog missing" };
+    return { ok: true };
+  });
+  if (!overlay.ok) fail(`modal overlay regression: ${overlay.why}`);
+  await page.keyboard.press("Escape");
+  await page.waitForTimeout(700);
+  const after = await page.evaluate(() => ({
+    backdropGone: ![...document.querySelectorAll("div")].some((d) => d.className.includes("bg-black/55")),
+    overflow: document.body.style.overflow,
+  }));
+  if (!after.backdropGone) fail("modal did not close on Escape");
+  if (after.overflow === "hidden") fail("body scroll lock NOT released after close");
+  console.log("5b. New-User modal: full-viewport backdrop + scroll lock + clean close");
+} else {
+  console.log("5b. (New-User button not found — modal check skipped)");
+}
+
+// ---- 5c. outbound Import-URL block (alpha.7 spec item 6) ------------------ #/
+await page.evaluate(() => { location.hash = "#/outbounds"; });
+await page.waitForTimeout(1500);
+const newOutboundBtn = page.locator('main button:has-text("outbound")').first();
+if (await newOutboundBtn.count()) {
+  await newOutboundBtn.click();
+  await page.waitForTimeout(900);
+  // the Import URL block renders only for URL-based kinds — switch the
+  // schema-driven kind selector to vless (default for the header button is "direct")
+  const kindSelect = page.locator('[role="dialog"] select').first();
+  if (await kindSelect.count()) await kindSelect.selectOption("vless");
+  await page.waitForTimeout(600);
+  const hasImport = await page.evaluate(() => (document.body.innerText || "").includes("Import URL") || (document.body.innerText || "").includes("ورود از لینک"));
+  if (!hasImport) fail("outbound dialog is missing the Import URL block");
+  await page.keyboard.press("Escape");
+  await page.waitForTimeout(500);
+  console.log("5c. outbound dialog exposes the Import URL block");
+} else {
+  console.log("5c. (New-Outbound button not found — import check skipped)");
+}
 
 // ---- 6. reloads ----------------------------------------------------------- #/
 for (let i = 1; i <= 3; i++) {
