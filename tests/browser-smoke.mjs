@@ -80,10 +80,12 @@ console.log("2. login ok, shell rendered");
 const created = await page.evaluate(async () => {
   const token = localStorage.getItem("zagros.token") || "";
   const name = "e2e-smoke-" + Math.random().toString(36).slice(2, 8);
+  // fresh installs ship exactly one inbound (shadowsocks); a proxy without a
+  // matching inbound is a REAL 400 — not a smoke failure target.
   const res = await fetch("/api/user", {
     method: "POST",
     headers: { "Content-Type": "application/json", Authorization: `Bearer ${token}` },
-    body: JSON.stringify({ username: name, proxies: {}, inbounds: {}, expire: 0, data_limit: 0 }),
+    body: JSON.stringify({ username: name, proxies: { shadowsocks: {} }, inbounds: {}, expire: 0, data_limit: 0 }),
   });
   return { status: res.status, name };
 });
