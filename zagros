@@ -35,6 +35,9 @@ ZAGROS_DATA="${ZAGROS_DATA:-/var/lib/zagros}"
 ZAGROS_BIN="${ZAGROS_BIN:-/usr/local/bin}"
 # Config leftovers outside the managed dirs (overridable for tests).
 ZAGROS_ETC="${ZAGROS_ETC:-/etc/zagros}"
+# Service/cron locations swept by the full uninstall (overridable for tests).
+SYSTEMD_DIR="${SYSTEMD_DIR:-/etc/systemd/system}"
+CRON_D_DIR="${CRON_D_DIR:-/etc/cron.d}"
 ZAGROS_SCRIPTS_REF="${ZAGROS_SCRIPTS_REF:-main}"
 COMPOSE_FILE="$ZAGROS_HOME/docker-compose.yml"
 # Configuration contract: ONE .env file is the single source of truth.
@@ -706,27 +709,58 @@ EOF
 # Full uninstall — the ONLY mode. There is no --purge anymore: `zagros
 # uninstall` wipes every trace of Zagros (containers, images, volumes,
 # networks, /opt, /var/lib, /etc, CLI) and then VERIFIES nothing is left.
+_u_systemd_units() {  # zagros*.service/timer files + registered units (always rc 0)
+    {
+        local f
+        for f in "$SYSTEMD_DIR"/zagros*.service "$SYSTEMD_DIR"/zagros*.timer; do
+            [[ -e $f ]] && basename "$f"
+        done 2>/dev/null
+        if command -v systemctl >/dev/null 2>&1; then
+            # systemctl errors when systemd is not booted (containers) and
+            # prints prose like "0 unit files listed." — filter to real unit
+            # names only and never propagate a nonzero status (pipefail).
+            systemctl list-unit-files 'zagros*.service' 'zagros*.timer' --no-legend 2>/dev/null \
+                | awk '{print $1}' | grep -E '^zagros.*\.(service|timer)$' || true
+        fi
+    } | sort -u
+    return 0
+}
+
+_u_cron_files() {  # cron.d drop-ins + crontab lines mentioning zagros (always rc 0)
+    local f
+    for f in "$CRON_D_DIR"/zagros*; do [[ -e $f ]] && echo "$f"; done 2>/dev/null
+    if command -v crontab >/dev/null 2>&1; then
+        crontab -l 2>/dev/null | grep -i zagros | sed 's/^/crontab: /' || true
+    fi
+    return 0
+}
+
 uninstall_summary() {
     # One honest pre-flight list of what will be destroyed.
-    local containers images volumes networks
+    local containers images volumes networks units crons cache
     containers=$(docker ps -a --format '{{.Names}}' 2>/dev/null | grep -c '^zagros' || true)
     images=$(docker images --format '{{.Repository}}' 2>/dev/null \
         | grep -cE "^(ghcr\.io/zagrosgm/zagros|mysql|mariadb|postgres)$" || true)
     volumes=$(docker volume ls --format '{{.Name}}' 2>/dev/null | grep -c '^zagros' || true)
     networks=$(docker network ls --format '{{.Name}}' 2>/dev/null | grep -c '^zagros' || true)
+    units=$(_u_systemd_units | grep -c . || true)
+    crons=$(_u_cron_files | grep -c . || true)
+    cache=0; [[ -e $HOME/.cache/zagros ]] && cache=1
     cat <<EOF
 The following will be PERMANENTLY destroyed (full uninstall):
   containers:    ${containers:-0} (zagros, zagros-db, any zagros-*)
   images:        ${images:-0} (panel: $IMAGE_REPO, db: mysql/mariadb/postgres)
   volumes:       ${volumes:-0} (any zagros-* docker volume)
   networks:      ${networks:-0} (any zagros-* docker network)
+  systemd units: ${units:-0} (any ${SYSTEMD_DIR}/zagros* unit)
+  cron jobs:     ${crons:-0} (${CRON_D_DIR}/zagros* files, crontab entries)
   databases:     SQLite file(s) and MySQL/PostgreSQL data dirs under $ZAGROS_DATA
-  configurations: $ZAGROS_HOME (compose file, .env, generated configs) and /etc/zagros
+  configurations: $ZAGROS_HOME (compose file, .env, generated configs) and $ZAGROS_ETC
   certificates:  TLS keys and certs under $ZAGROS_DATA
   runtime data:  cores, inbounds settings, subscription payloads under $ZAGROS_DATA
   logs:          panel + core logs under $ZAGROS_DATA
   backups:       $ZAGROS_DATA/backups (all backup archives)
-  CLI:           $ZAGROS_BIN/zagros
+  CLI:           $ZAGROS_BIN/zagros (+ ${cache} cache dir)
 Afterwards the system must look like Zagros was never installed.
 EOF
 }
@@ -771,13 +805,32 @@ uninstall_docker_sweep() {
 }
 
 uninstall_filesystem_sweep() {
-    log_step "filesystem sweep (/opt, /var/lib, /etc, CLI)"
+    log_step "filesystem sweep (/opt, /var/lib, /etc, systemd, cron, CLI, cache)"
+    # systemd units first (stop them before their files vanish)
+    local u
+    while IFS= read -r u; do
+        [[ -n $u ]] || continue
+        if command -v systemctl >/dev/null 2>&1; then
+            systemctl disable --now "$u" >/dev/null 2>&1 || true
+        fi
+        rm -f "$SYSTEMD_DIR/$u"
+    done < <(_u_systemd_units)
+    if command -v systemctl >/dev/null 2>&1; then
+        systemctl daemon-reload >/dev/null 2>&1 || true
+        systemctl reset-failed >/dev/null 2>&1 || true
+    fi
+    # cron jobs
+    rm -f "$CRON_D_DIR"/zagros* 2>/dev/null || true
+    if command -v crontab >/dev/null 2>&1 && crontab -l 2>/dev/null | grep -qi zagros; then
+        { crontab -l 2>/dev/null | grep -vi zagros || true; } | crontab - 2>/dev/null || true
+    fi
     rm -rf "$ZAGROS_HOME"   # compose file, .env, state, generated configs
     rm -rf "$ZAGROS_DATA"   # databases (sqlite/mysql/postgres files), cores,
                             # certificates, TLS keys, runtime data, logs, backups, cache
     rm -rf "$ZAGROS_ETC"     # legacy/config leftovers where present
     rm -f  "$ZAGROS_BIN/zagros"
-    log_ok "removed $ZAGROS_HOME, $ZAGROS_DATA, /etc/zagros and the CLI"
+    rm -rf "$HOME/.cache/zagros"   # CLI cache (only the exact known dir — never globs)
+    log_ok "removed $ZAGROS_HOME, $ZAGROS_DATA, $ZAGROS_ETC, units, cron jobs, cache and the CLI"
 }
 
 uninstall_verify() {
@@ -792,14 +845,19 @@ uninstall_verify() {
     [[ -n "$found" ]] && leftovers+=("volumes: $(tr '\n' ' ' <<<"$found")")
     found=$(docker network ls --format '{{.Name}}' 2>/dev/null | grep '^zagros' || true)
     [[ -n "$found" ]] && leftovers+=("networks: $(tr '\n' ' ' <<<"$found")")
+    found=$(_u_systemd_units)
+    [[ -n "$found" ]] && leftovers+=("systemd units: $(tr '\n' ' ' <<<"$found")")
+    found=$(_u_cron_files)
+    [[ -n "$found" ]] && leftovers+=("cron jobs: $(tr '\n' ' ' <<<"$found")")
     [[ -e "$ZAGROS_HOME" ]] && leftovers+=("$ZAGROS_HOME")
     [[ -e "$ZAGROS_DATA" ]] && leftovers+=("$ZAGROS_DATA")
     [[ -e "$ZAGROS_ETC" ]] && leftovers+=("$ZAGROS_ETC")
     [[ -e "$ZAGROS_BIN/zagros" ]] && leftovers+=("$ZAGROS_BIN/zagros")
+    [[ -e "$HOME/.cache/zagros" ]] && leftovers+=("$HOME/.cache/zagros")
 
     if ((${#leftovers[@]})); then
         log_warn "leftovers detected — forcing removal: ${leftovers[*]}"
-        local c v n i
+        local c v n i u
         while read -r c; do [[ -n "$c" ]] && docker rm -f "$c" >/dev/null 2>&1 || true; done \
             < <(docker ps -a --format '{{.Names}}' 2>/dev/null | grep '^zagros' || true)
         while read -r i; do [[ -n "$i" ]] && docker rmi -f "$i" >/dev/null 2>&1 || true; done \
@@ -809,7 +867,21 @@ uninstall_verify() {
             < <(docker volume ls --format '{{.Name}}' 2>/dev/null | grep '^zagros' || true)
         while read -r n; do [[ -n "$n" ]] && docker network rm "$n" >/dev/null 2>&1 || true; done \
             < <(docker network ls --format '{{.Name}}' 2>/dev/null | grep '^zagros' || true)
-        rm -rf "$ZAGROS_HOME" "$ZAGROS_DATA" "$ZAGROS_ETC"
+        while read -r u; do
+            [[ -n "$u" ]] || continue
+            if command -v systemctl >/dev/null 2>&1; then
+                systemctl disable --now "$u" >/dev/null 2>&1 || true
+            fi
+            rm -f "$SYSTEMD_DIR/$u"
+        done < <(_u_systemd_units)
+        rm -f "$CRON_D_DIR"/zagros* 2>/dev/null || true
+        if command -v crontab >/dev/null 2>&1 && crontab -l 2>/dev/null | grep -qi zagros; then
+            { crontab -l 2>/dev/null | grep -vi zagros || true; } | crontab - 2>/dev/null || true
+        fi
+        if command -v systemctl >/dev/null 2>&1; then
+            systemctl daemon-reload >/dev/null 2>&1 || true
+        fi
+        rm -rf "$ZAGROS_HOME" "$ZAGROS_DATA" "$ZAGROS_ETC" "$HOME/.cache/zagros"
         rm -f "$ZAGROS_BIN/zagros"
         # final re-check — honesty: fail loudly instead of claiming success
         leftovers=()
@@ -817,11 +889,14 @@ uninstall_verify() {
         [[ -e "$ZAGROS_DATA" ]] && leftovers+=("$ZAGROS_DATA")
         [[ -e "$ZAGROS_ETC" ]] && leftovers+=("$ZAGROS_ETC")
         [[ -e "$ZAGROS_BIN/zagros" ]] && leftovers+=("$ZAGROS_BIN/zagros")
+        [[ -e "$HOME/.cache/zagros" ]] && leftovers+=("$HOME/.cache/zagros")
         [[ $(docker ps -a --format '{{.Names}}' 2>/dev/null | grep -c '^zagros' || true) == "0" ]] \
             || leftovers+=("docker containers")
+        [[ -z "$(_u_systemd_units)" ]] || leftovers+=("systemd units")
+        [[ -z "$(_u_cron_files)" ]] || leftovers+=("cron jobs")
         ((${#leftovers[@]})) && die "uninstall incomplete, still present: ${leftovers[*]} — remove manually and report."
     fi
-    log_ok "verified: no Zagros containers, images, volumes, networks, dirs or CLI remain"
+    log_ok "verified: no Zagros containers, images, volumes, networks, units, cron jobs, dirs, cache or CLI remain"
 }
 
 cmd_uninstall() {

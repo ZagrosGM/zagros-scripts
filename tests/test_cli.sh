@@ -28,6 +28,8 @@ export ZAGROS_DATA="$T/var/lib/zagros"
 export ZAGROS_BIN="$T/bin"
 export FAKE_DOCKER_STATE="$T/faked-state"
 export ZAGROS_ETC="$T/etc/zagros"
+export SYSTEMD_DIR="$T/systemd"
+export CRON_D_DIR="$T/cron.d"
 export NO_COLOR=1
 export ASSUME_YES=1
 export PATH="$REPO_ROOT/tests/faked:$PATH"
@@ -396,6 +398,60 @@ run bash "$CLI" install
 expect_rc "reinstall rc0" 0
 run bash "$CLI" uninstall --yes
 expect_rc "second full uninstall rc0" 0
+
+# ----------------------------------------------------------------------------- #
+say "t16b full uninstall sweeps units/cron/cache + stray docker artifacts, spares others"
+# spec's remaining categories: systemd units, cron jobs, CLI cache — plus
+# stray zagros* docker resources AND other apps' resources that must SURVIVE.
+reset_fake
+run bash "$CLI" install
+expect_rc "t16b install rc0" 0
+python3 - <<'EOF'
+import json, os, pathlib
+sd = pathlib.Path(os.environ["FAKE_DOCKER_STATE"]); sd.mkdir(parents=True, exist_ok=True)
+c = json.loads((sd / "containers.json").read_text()) if (sd / "containers.json").exists() else {}
+c["zagros-rogue"] = {"running": False, "healthy": False}
+(sd / "containers.json").write_text(json.dumps(c))
+(sd / "volumes.json").write_text(json.dumps(["zagros_vol", "other_vol"]))
+(sd / "networks.json").write_text(json.dumps(["zagros_net", "other_net"]))
+EOF
+mkdir -p "$SYSTEMD_DIR" "$CRON_D_DIR"
+touch "$SYSTEMD_DIR/zagros-panel.service" "$CRON_D_DIR/zagros-backup"
+mkdir -p "$HOME/.cache/zagros"; touch "$HOME/.cache/zagros/etag"
+
+# refuses without confirmation (spec: summary first, then ask)
+run env -u ASSUME_YES bash "$CLI" uninstall </dev/null
+expect_rc "uninstall without confirmation aborts" 1
+expect_out "summary printed before asking" "PERMANENTLY destroyed"
+expect_out "summary covers systemd units" "systemd units:"
+expect_out "summary covers cron jobs" "cron jobs:"
+
+run bash "$CLI" uninstall --yes
+expect_rc "t16b full uninstall rc0" 0
+expect_out "extended verify line" "units, cron jobs"
+expect_no_file "$SYSTEMD_DIR/zagros-panel.service" "systemd unit removed"
+expect_no_file "$CRON_D_DIR/zagros-backup" "cron file removed"
+expect_no_file "$HOME/.cache/zagros" "CLI cache removed"
+expect_no_file "$ZAGROS_DATA" "data dir removed"
+python3 - <<'EOF'
+import json, os, pathlib, sys
+sd = pathlib.Path(os.environ["FAKE_DOCKER_STATE"])
+vols = json.loads((sd / "volumes.json").read_text())
+nets = json.loads((sd / "networks.json").read_text())
+cons = json.loads((sd / "containers.json").read_text())
+problems = []
+if cons: problems.append(f"containers left: {sorted(cons)}")
+if vols != ["other_vol"]: problems.append(f"volumes wrong: {vols}")
+if nets != ["other_net"]: problems.append(f"networks wrong: {nets}")
+if problems:
+    print("LEAK: " + "; ".join(problems)); sys.exit(1)
+print("stray docker resources swept; other_vol/other_net preserved")
+EOF
+[[ $? -eq 0 ]] && ok "stray docker artifacts swept surgically" || bad "stray docker artifacts swept surgically" "see LEAK"
+
+# idempotent: nothing-left runs cleanly
+run bash "$CLI" uninstall --yes
+expect_rc "t16b repeat uninstall rc0" 0
 
 # ----------------------------------------------------------------------------- #
 say "t17 one-liner idempotency: CLI already living at ZAGROS_BIN"

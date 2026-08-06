@@ -132,6 +132,18 @@ jobs:
           sudo -E ASSUME_YES=1 zagros update -y || sudo zagros rollback --yes
           sudo zagros status
 
+      - name: browser smoke — REAL Chromium gates the SPA (alpha.5 white-screen regression)
+        run: |
+          set -e
+          cd tests
+          npm init -y >/dev/null 2>&1 || true
+          npm i playwright@1.45.0 --no-audit --no-fund
+          npx playwright install --with-deps chromium
+          # spec: the panel must survive AT LEAST 5 minutes — soak is 300 s
+          PANEL_URL="http://127.0.0.1:8000/dashboard/" \
+          PANEL_USER=e2e-admin PANEL_PASS='E2e-Test-Pass-1' SOAK_SECS=300 \
+            node browser-smoke.mjs
+
       - name: logs tail for diagnosis
         run: sudo zagros logs --tail 30 --no-follow
 
