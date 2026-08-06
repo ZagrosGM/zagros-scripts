@@ -137,7 +137,7 @@ CLI cheatsheet: `zagros config show` (masked overview) ·
 | `logs [zagros\|zagros-db] [--tail N] [--no-follow]` | Service logs (follows by default). |
 | `shell` | `exec` into the panel container (`bash`, falls back to `sh`). |
 | `version` | CLI, image tag, panel version, newest release. |
-| `uninstall [-y]` | **Full uninstall** — destroys everything: containers, panel+DB images, volumes, networks, `/opt/zagros`, `/var/lib/zagros` (databases, backups, certificates, logs, runtime data), `/etc/zagros` and the CLI itself. Prints a removal summary first, then verifies nothing is left. |
+| `uninstall [-y]` | **Full uninstall** — destroys everything: containers, panel+DB images, volumes, networks, systemd units, cron jobs, `/opt/zagros`, `/var/lib/zagros` (databases, backups, certificates, logs, runtime data, caches), `/etc/zagros` and the CLI itself. Prints a removal summary first, then verifies nothing is left (second sweep + loud failure on any survivor). |
 
 ### Operations
 
