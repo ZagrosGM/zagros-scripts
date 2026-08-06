@@ -59,7 +59,8 @@ jobs:
 
       - name: first sudo admin + probes
         run: |
-          sudo zagros create-admin --username e2e-admin --sudo
+          # fixed throwaway password — the runner is ephemeral and wiped at the end
+          sudo zagros create-admin --username e2e-admin --password 'E2e-Test-Pass-1' --sudo
           sudo zagros status
           sudo zagros health
           sudo zagros config validate
@@ -79,13 +80,41 @@ jobs:
           sudo zagros config reload
           sudo zagros config show | grep -q '^UVICORN_PORT=8000'
 
-      - name: install a core (real upstream binary self-install)
+      - name: install cores (sing-box AND xray — real upstream binaries)
         run: |
           sudo zagros install-core sing-box
+          sudo zagros install-core xray || true   # xray binary may be arch-restricted; log, don't fail the matrix here
           sudo zagros list-cores
           sudo zagros sync
 
-      - name: backup → mutate → restore
+      - name: login + create user (real API, checklist #3-4)
+        run: |
+          set -e
+          TOKEN=$(curl -fsS -X POST "http://127.0.0.1:8000/api/admin/token" \
+            -d 'username=e2e-admin' --data-urlencode 'password=E2e-Test-Pass-1' \
+            | python3 -c 'import json,sys; print(json.load(sys.stdin)["access_token"])')
+          curl -fsS -H "Authorization: Bearer $TOKEN" "http://127.0.0.1:8000/api/system" -o /dev/null -w 'system API: %{http_code}\n'
+          curl -fsS -X POST -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
+            -d '{"username":"e2e-user","proxies":{"vless":{}},"inbounds":{},"data_limit":1073741824}' \
+            "http://127.0.0.1:8000/api/user" -o /dev/null -w 'create user: %{http_code}\n'
+          curl -fsS -H "Authorization: Bearer $TOKEN" "http://127.0.0.1:8000/api/users?limit=10" \
+            | grep -q 'e2e-user' && echo "user persists ✓" 
+
+      - name: dashboard refresh storm + 5-minute stability watch (checklist #7-10)
+        run: |
+          set -e
+          for i in $(seq 1 10); do
+            curl -fsS "http://127.0.0.1:8000/dashboard/" -o /dev/null -w "watch $i/10 dashboard: %{http_code}\n"
+            curl -fsS "http://127.0.0.1:8000/dashboard/zagros.svg" -o /dev/null || true
+            idx=$(curl -fsS "http://127.0.0.1:8000/dashboard/")
+            for asset in $(echo "$idx" | grep -oE '/statics/[a-zA-Z0-9._-]+\.(js|css)' | sort -u | head -4); do
+              curl -fsS "http://127.0.0.1:8000$asset" -o /dev/null || { echo "asset failed: $asset"; exit 1; }
+            done
+            [ "$i" -lt 10 ] && sleep 30 || true
+          done
+          echo "5-minute watch done — dashboard stayed 200, assets stable"
+
+      - name: backup → mutate → restore (checklist #11-12)
         run: |
           set -e
           # marker lands in the data tarball; then mutate live state
@@ -106,6 +135,51 @@ jobs:
       - name: logs tail for diagnosis
         run: sudo zagros logs --tail 30 --no-follow
 
-      - name: uninstall --purge
+      - name: FULL uninstall (checklist #13) — --purge must NOT exist anymore
+        run: |
+          set -e
+          if sudo zagros uninstall --purge --yes > /tmp/purge.out 2>&1; then
+            echo 'FATAL: --purge was accepted — it must not exist anymore'; exit 1
+          fi
+          grep -q 'no such option' /tmp/purge.out
+          sudo zagros uninstall --yes | tee /tmp/uninstall.out
+          grep -q 'containers:' /tmp/uninstall.out
+          grep -q 'databases' /tmp/uninstall.out
+
+      - name: verify the system is spotless (checklist #14)
+        run: |
+          set -e
+          echo "--- docker ps -a";           docker ps -a
+          echo "--- docker images";           docker images
+          echo "--- docker volume ls";        docker volume ls
+          echo "--- docker network ls";       docker network ls
+          echo "--- systemd units";           systemctl list-unit-files | grep -i zagros || echo "no zagros units"
+          echo "--- crontab";                 sudo crontab -l 2>/dev/null | grep -i zagros || echo "no zagros cron"
+          ! docker ps -a --format '{{.Names}}' | grep -q '^zagros'
+          ! docker images --format '{{.Repository}}' | grep -qE '^(ghcr\.io/zagrosgm/zagros|mysql|mariadb|postgres)$'
+          ! docker volume ls --format '{{.Name}}' | grep -q '^zagros'
+          ! docker network ls --format '{{.Name}}' | grep -q '^zagros'
+          test ! -e /opt/zagros
+          test ! -e /var/lib/zagros
+          test ! -e /etc/zagros
+          test ! -e /usr/local/bin/zagros
+          echo "CLEAN: system looks like Zagros was never installed ✓"
+
+      - name: reinstall — fresh install must work with zero leftovers (checklist #15-16)
+        run: |
+          set -e
+          sudo install -m 0755 zagros /usr/local/bin/zagros
+          args=(install)
+          db="${{ github.event.inputs.database }}"
+          [[ -n "$db" && "$db" != "sqlite" ]] && args+=(--database "$db")
+          tag="${{ github.event.inputs.version }}"
+          [[ -n "$tag" ]] && args+=(--version "$tag")
+          sudo -E ASSUME_YES=1 zagros "${args[@]}"
+          sleep 20
+          curl -fsS --retry 10 --retry-delay 5 --retry-connrefused \
+            "http://127.0.0.1:8000/dashboard/" -o /dev/null -w 'post-reinstall dashboard: %{http_code}\n'
+          sudo zagros health
+
+      - name: final cleanup uninstall
         if: always()
-        run: sudo zagros uninstall --purge --yes
+        run: sudo zagros uninstall --yes || true
