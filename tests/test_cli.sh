@@ -103,6 +103,13 @@ grep -q 'image: ghcr.io/zagrosgm/zagros:${ZAGROS_IMAGE_TAG:-latest}' "$ZAGROS_HO
 # config contract: mount-only, NO env injection on the panel service
 grep -q './.env:/code/.env:ro' "$ZAGROS_HOME/docker-compose.yml" \
     && ok "compose mounts ./.env -> /code/.env (ro)" || bad "compose mounts ./.env -> /code/.env (ro)"
+# TUN cores (OpenVPN/WireGuard) run inside this container: they need the
+# tunnel device + NET_ADMIN or their Start dies at interface creation (the
+# alpha.7 field reports: openvpn management unreachable, wg-quick failing)
+grep -qE '^\s+- NET_ADMIN$' "$ZAGROS_HOME/docker-compose.yml" \
+    && ok "compose grants NET_ADMIN for TUN cores" || bad "compose grants NET_ADMIN for TUN cores"
+grep -q '/dev/net/tun:/dev/net/tun' "$ZAGROS_HOME/docker-compose.yml" \
+    && ok "compose passes /dev/net/tun device" || bad "compose passes /dev/net/tun device"
 grep -q 'env_file:' "$ZAGROS_HOME/docker-compose.yml" \
     && bad "panel service has NO env_file injection" || ok "panel service has NO env_file injection"
 grep -q "open('/code/.env'" "$ZAGROS_HOME/docker-compose.yml" \
