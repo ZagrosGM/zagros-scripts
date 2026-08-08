@@ -24,7 +24,7 @@
 # =============================================================================
 set -euo pipefail
 
-ZAGROS_CLI_VERSION="1.0.0-alpha.7.3"
+ZAGROS_CLI_VERSION="1.0.0-alpha.7.4"
 SCRIPTS_REPO_RAW="https://raw.githubusercontent.com/ZagrosGM/zagros-scripts"
 PANEL_REPO="ZagrosGM/Zagros"
 PANEL_API="https://api.github.com/repos/${PANEL_REPO}"
@@ -612,6 +612,32 @@ fallback_manifest() {  # no python3 on host — shell manifest
 # ============================================================================= #
 
 # ---------------------------------------------------------------- install ---#
+host_tun_preflight() {  # warn-only: host readiness for TUN-based cores
+    # The container reaches /dev/net/tun only when the HOST kernel exposes it.
+    # On KVM/bare-metal that is one modprobe away; on LXC/OpenVZ the provider
+    # must grant the device — userland cannot fix that, so say so plainly and
+    # persist the module for reboots where we CAN fix it.
+    if command -v modprobe >/dev/null 2>&1; then
+        modprobe tun 2>/dev/null || true
+        modprobe wireguard 2>/dev/null || true
+        if [[ -c /dev/net/tun && ! -f /etc/modules-load.d/zagros-tun.conf ]]; then
+            printf 'tun\n' > /etc/modules-load.d/zagros-tun.conf 2>/dev/null || true
+        fi
+    fi
+    if [[ -c /dev/net/tun ]]; then
+        log_ok "TUN device present (/dev/net/tun)"
+    else
+        log_warn "no /dev/net/tun on this host — OpenVPN/WireGuard cores cannot start.
+  Fix (KVM/bare-metal):  modprobe tun && echo tun >> /etc/modules-load.d/tun.conf
+  Fix (LXC/OpenVZ VPS):  enable the TUN/TAP device in your provider panel"
+    fi
+    if lsmod 2>/dev/null | grep -q '^wireguard ' || [[ -d /sys/module/wireguard ]]; then
+        log_ok "wireguard kernel module available"
+    else
+        log_warn "wireguard kernel module not loaded (kernel >= 5.6 ships it; older kernels need wireguard-dkms)"
+    fi
+}
+
 cmd_install() {
     local db_kind="sqlite" version="" channel="stable"
     while (($#)); do
@@ -635,6 +661,7 @@ cmd_install() {
     ensure_cmd jq jq
     ensure_cmd openssl openssl
     ensure_docker
+    host_tun_preflight
 
     mkdir -p "$ZAGROS_HOME" "$STATE_DIR" "$ZAGROS_DATA" "$BACKUP_DIR" \
              "$ZAGROS_DATA/cores" "$ZAGROS_DATA/logs"
@@ -984,8 +1011,26 @@ cmd_update() {
 update_apply() {  # update_apply <tag> → 0 ok / 1 fail
     local version="$1"
     env_set ZAGROS_IMAGE_TAG "$version"
+    # The compose TEMPLATE evolves between CLI releases (e.g. 1.0.0-alpha.7.2
+    # added /dev/net/tun + NET_ADMIN so TUN-based cores — OpenVPN/WireGuard —
+    # can start INSIDE the container). A running install's compose file is
+    # otherwise rendered once at install time and never converges: update
+    # would keep re-creating containers from the old capability-poor spec
+    # (field report alpha.7.4: wg-quick/openvpn "Operation not permitted"
+    # right after a successful update). Re-render and, when the rendered
+    # file actually changed, force-recreate so the new spec takes effect.
+    local db_kind old_hash="" new_hash
+    db_kind="$(env_get ZAGROS_DB_KIND)"; db_kind="${db_kind:-sqlite}"
+    [[ -f "$COMPOSE_FILE" ]] && old_hash="$(sha256sum "$COMPOSE_FILE" | cut -d' ' -f1)"
+    render_compose "$db_kind"
+    new_hash="$(sha256sum "$COMPOSE_FILE" | cut -d' ' -f1)"
     compose pull >/dev/null || { log_err "image pull failed ($version)"; return 1; }
-    compose up -d >/dev/null || { log_err "compose up failed"; return 1; }
+    if [[ -n "$old_hash" && "$old_hash" != "$new_hash" ]]; then
+        log_info "compose definition changed (template update) → force-recreating containers"
+        compose up -d --force-recreate >/dev/null || { log_err "compose up failed"; return 1; }
+    else
+        compose up -d >/dev/null || { log_err "compose up failed"; return 1; }
+    fi
     wait_healthy "$SERVICE" 240 || { log_err "panel did not become healthy"; return 1; }
     wait_healthy "$DB_SERVICE" 60 >/dev/null 2>&1 || true
     panel_exec python3 -m alembic upgrade head >/dev/null 2>&1 || { log_err "schema migration failed"; return 1; }
@@ -1479,6 +1524,31 @@ cmd_doctor() {
         compose_probe 2>/dev/null && dr OK "compose" "$("${COMPOSE[@]}" version 2>/dev/null | head -1)" || dr FAIL "compose" "compose plugin missing"
     else
         dr FAIL "docker" "not installed"
+    fi
+
+    # --- TUN / kernel modules (TUN-based cores: OpenVPN, WireGuard)
+    if [[ -c /dev/net/tun ]]; then
+        dr OK "tun device" "/dev/net/tun present"
+    else
+        dr WARN "tun device" "missing — OpenVPN/WireGuard cannot start (bare-metal/KVM: modprobe tun; LXC/OpenVZ: enable TUN/TAP in the provider panel)"
+    fi
+    if lsmod 2>/dev/null | grep -q '^wireguard ' || [[ -d /sys/module/wireguard ]]; then
+        dr OK "wireguard module" "available"
+    else
+        dr WARN "wireguard module" "not loaded (modprobe wireguard; kernels < 5.6 need wireguard-dkms)"
+    fi
+    # The RUNNING container must actually carry the caps the cores need —
+    # containers created by an older CLI template keep their old spec until
+    # an update force-recreates them (alpha.7.4 field failure pattern).
+    if command -v docker >/dev/null 2>&1 && docker inspect "$SERVICE" >/dev/null 2>&1; then
+        local caps devs
+        caps="$(docker inspect --format '{{json .HostConfig.CapAdd}}' "$SERVICE" 2>/dev/null || true)"
+        devs="$(docker inspect --format '{{json .HostConfig.Devices}}' "$SERVICE" 2>/dev/null || true)"
+        if [[ "$caps" == *NET_ADMIN* && "$devs" == *net/tun* ]]; then
+            dr OK "container caps" "NET_ADMIN + /dev/net/tun granted"
+        else
+            dr WARN "container caps" "missing NET_ADMIN or /dev/net/tun — TUN cores cannot start; fix: zagros update --force (re-renders compose & recreates)"
+        fi
     fi
 
     # --- image & registry
