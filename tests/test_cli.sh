@@ -302,6 +302,28 @@ grep -q 'alembic' "$FAKE_DOCKER_STATE/invocations.jsonl" \
 run bash "$CLI" update --version 9.9.9-test
 expect_rc "bare version accepted (v-prefix normalized)" 0
 
+# alpha.7.4 (items 2/3): a compose rendered by an OLD template (no
+# /dev/net/tun + NET_ADMIN) must be re-rendered at update time and the
+# container force-recreated — else TUN cores keep dying post-update.
+sed -i '/^  *- NET_ADMIN$/d; /\/dev\/net\/tun:\/dev\/net\/tun/d; /^  *cap_add:$/d; /^  *devices:$/d' \
+    "$ZAGROS_HOME/docker-compose.yml"
+! grep -q 'net/tun' "$ZAGROS_HOME/docker-compose.yml" \
+    && ok "stale (pre-alpha.7.2) compose simulated" || bad "stale (pre-alpha.7.2) compose simulated"
+run bash "$CLI" update --version v9.9.9-test --force
+expect_rc "update with stale compose rc0" 0
+grep -q '/dev/net/tun:/dev/net/tun' "$ZAGROS_HOME/docker-compose.yml" \
+    && ok "update re-rendered compose with TUN device" || bad "update re-rendered compose with TUN device"
+grep -qE '^  *- NET_ADMIN$' "$ZAGROS_HOME/docker-compose.yml" \
+    && ok "update re-rendered compose with NET_ADMIN" || bad "update re-rendered compose with NET_ADMIN"
+grep -q 'force-recreate' "$FAKE_DOCKER_STATE/invocations.jsonl" \
+    && ok "compose change triggered --force-recreate" || bad "compose change triggered --force-recreate"
+n_fr_before=$(grep -c 'force-recreate' "$FAKE_DOCKER_STATE/invocations.jsonl" || true)
+run bash "$CLI" update --version v9.9.9-test --force --no-backup
+expect_rc "update with converged compose rc0" 0
+n_fr_after=$(grep -c 'force-recreate' "$FAKE_DOCKER_STATE/invocations.jsonl" || true)
+[[ "$n_fr_after" == "$n_fr_before" ]] && ok "converged compose does not force-recreate again" \
+    || bad "converged compose does not force-recreate again ($n_fr_before → $n_fr_after)"
+
 FAKE_COMPOSE_PULL_OK=0; export FAKE_COMPOSE_PULL_OK
 run bash "$CLI" update --version v8.8.8-broken
 expect_rc "failed update exits non-zero" 1
