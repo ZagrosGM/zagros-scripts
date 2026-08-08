@@ -107,8 +107,6 @@ def panel_boot_effects() -> None:
 CORE_CAPS = {
     "xray": ["shadowsocks", "trojan", "vless", "vmess"],
     "sing-box": ["hysteria2", "shadowsocks", "trojan", "tuic", "vless"],
-    "hysteria2": ["hysteria2"],
-    "tuic": ["tuic"],
     "wireguard": ["wireguard"],
     "openvpn": ["openvpn"],
     "ssh": ["ssh"],
