@@ -24,7 +24,7 @@
 # =============================================================================
 set -euo pipefail
 
-ZAGROS_CLI_VERSION="1.0.0-alpha.7.1"
+ZAGROS_CLI_VERSION="1.0.0-alpha.7.2"
 SCRIPTS_REPO_RAW="https://raw.githubusercontent.com/ZagrosGM/zagros-scripts"
 PANEL_REPO="ZagrosGM/Zagros"
 PANEL_API="https://api.github.com/repos/${PANEL_REPO}"
@@ -694,7 +694,7 @@ Next steps:
       devices all live there; Config Studio = its Settings → Advanced Mode)
   3. Configure anything:            zagros config edit   (file: $ENV_FILE)
      then apply it all:             zagros restart
-  4. Install a core when needed:    zagros install-core <xray|sing-box|hysteria2|tuic|...>
+  4. Install a core when needed:    zagros install-core <xray|sing-box|wireguard|openvpn|ssh|softether>
      (or from the panel: Cores → catalog → install — same capability engine)
 EOF
 }
@@ -1840,7 +1840,7 @@ cmd_reset_admin() {
 }
 
 # ------------------------------------------------------------------ cores ---#
-ZAGROS_KNOWN_CORES="xray sing-box hysteria2 tuic wireguard openvpn ssh softether"
+ZAGROS_KNOWN_CORES="xray sing-box wireguard openvpn ssh softether"  # alpha.7.2: hysteria2/tuic merged into sing-box
 
 cmd_list_cores() {
     require_installed
