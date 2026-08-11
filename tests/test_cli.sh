@@ -119,6 +119,10 @@ grep -qE '^UVICORN_HOST=0.0.0.0$' "$ZAGROS_HOME/.env" \
     && ok "bind host 0.0.0.0 in .env" || bad "bind host 0.0.0.0 in .env"
 grep -qE '^TLS_MODE=auto$' "$ZAGROS_HOME/.env" \
     && ok "TLS_MODE=auto default in .env" || bad "TLS_MODE=auto default in .env"
+grep -qE '^XRAY_JSON=/var/lib/zagros/cores/xray/xray_config.json$' "$ZAGROS_HOME/.env" \
+    && ok "Xray config uses persistent mounted path" || bad "Xray config uses persistent mounted path"
+grep -qE '^XRAY_EXECUTABLE_PATH=/var/lib/zagros/cores/xray/bin/xray$' "$ZAGROS_HOME/.env" \
+    && ok "Xray binary uses persistent mounted path" || bad "Xray binary uses persistent mounted path"
 grep -qE '^ZAGROS_IMAGE_TAG=(v[0-9]|latest$)' "$ZAGROS_HOME/.env" \
     && ok "env carries resolved tag or documented 'latest' fallback (GitHub API may be rate-limited)" \
     || bad "env carries resolved release tag"
@@ -235,6 +239,12 @@ say "t09 backup creates a verifiable archive"
 run bash "$CLI" install-core wireguard
 expect_rc "install wireguard rc0" 0
 touch "$ZAGROS_DATA/wg-marker.conf"; echo test-key > "$ZAGROS_DATA/wg-marker.conf"
+# SoftEther stores vpn_server.config beside its daemon. The config is durable
+# upgrade/restore state; the large self-installable binaries are not.
+mkdir -p "$ZAGROS_DATA/cores/softether/runtime"
+printf 'declare root config state\n' > "$ZAGROS_DATA/cores/softether/runtime/vpn_server.config"
+printf 'redownloadable daemon\n' > "$ZAGROS_DATA/cores/softether/runtime/vpnserver"
+printf 'redownloadable admin tool\n' > "$ZAGROS_DATA/cores/softether/runtime/vpncmd"
 run bash "$CLI" backup
 expect_rc "backup rc0" 0
 ARCHIVE="$(printf '%s' "$LAST_OUT" | grep -oE "$ZAGROS_DATA/backups/zagros-backup-[^ ]+\.tar\.gz" | head -1)"
@@ -262,6 +272,12 @@ tar -tzf "$X/data/panel-data.tar.gz" | grep -q 'wg-marker.conf' \
     && ok "marker file inside data tarball" || bad "marker file inside data tarball"
 tar -tzf "$X/data/panel-data.tar.gz" | grep -q 'zagros.db' \
     && bad "raw sqlite excluded from data tarball" || ok "raw sqlite excluded from data tarball"
+tar -tzf "$X/data/panel-data.tar.gz" | grep -q 'cores/softether/runtime/vpn_server.config' \
+    && ok "SoftEther server config retained in backup" \
+    || bad "SoftEther server config retained in backup"
+tar -tzf "$X/data/panel-data.tar.gz" | grep -q 'cores/softether/runtime/vpnserver' \
+    && bad "SoftEther redownloadable binaries excluded" \
+    || ok "SoftEther redownloadable binaries excluded"
 
 # ----------------------------------------------------------------------------- #
 say "t10 restore: dry-run, wrong-kind guard, real restore with mutation"
@@ -290,11 +306,23 @@ grep -q '^UVICORN_PORT=8000$' "$ZAGROS_HOME/.env" \
 
 # ----------------------------------------------------------------------------- #
 say "t11 update: happy path, idempotency, failure+auto-rollback"
+# Simulate an alpha.7.7 env whose Xray paths still lived in the replaceable
+# container filesystem. Exact historical defaults migrate; real custom paths
+# remain operator-owned.
+sed -i \
+    -e 's|^XRAY_JSON=.*|XRAY_JSON=./xray_config.json|' \
+    -e 's|^XRAY_EXECUTABLE_PATH=.*|XRAY_EXECUTABLE_PATH=/usr/local/bin/xray|' \
+    -e 's|^XRAY_ASSETS_PATH=.*|XRAY_ASSETS_PATH=/usr/local/share/xray|' \
+    "$ZAGROS_HOME/.env"
 run bash "$CLI" update --version v9.9.9-test
 expect_rc "update rc0" 0
 expect_out "update summary" "update complete"
 grep -q '^ZAGROS_IMAGE_TAG=v9.9.9-test$' "$ZAGROS_HOME/.env" \
     && ok "env tag flipped" || bad "env tag flipped"
+grep -q '^XRAY_JSON=/var/lib/zagros/cores/xray/xray_config.json$' "$ZAGROS_HOME/.env" \
+    && ok "update repairs persistent Xray config path" || bad "update repairs persistent Xray config path"
+grep -q '^XRAY_EXECUTABLE_PATH=/var/lib/zagros/cores/xray/bin/xray$' "$ZAGROS_HOME/.env" \
+    && ok "update repairs persistent Xray binary path" || bad "update repairs persistent Xray binary path"
 jq -e '.result == "ok" and .to_tag == "v9.9.9-test"' "$ZAGROS_HOME/.state/last-update.json" >/dev/null \
     && ok "last-update.json records success" || bad "last-update.json records success"
 grep -q 'alembic' "$FAKE_DOCKER_STATE/invocations.jsonl" \
