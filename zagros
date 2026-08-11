@@ -471,9 +471,12 @@ ZAGROS_APP_NAME=Zagros
 # ZAGROS_CLIENT_AUTH_MODE=subscription_link
 
 # ── drivers / cores ──
-# XRAY_JSON=./xray_config.json
-# XRAY_EXECUTABLE_PATH=/usr/local/bin/xray
-# XRAY_ASSETS_PATH=/usr/local/share/xray
+# Xray binary, assets and accepted Studio document live on the mounted data
+# tree, so image replacement cannot silently reset listeners or require an
+# install/update action.
+XRAY_JSON=/var/lib/zagros/cores/xray/xray_config.json
+XRAY_EXECUTABLE_PATH=/var/lib/zagros/cores/xray/bin/xray
+XRAY_ASSETS_PATH=/var/lib/zagros/cores/xray/assets
 # Additional cores are managed from the panel/CLI (zagros list-cores) —
 # their settings live in the database, not here.
 # DISABLE_RECORDING_NODE_USAGE=false
@@ -1036,6 +1039,21 @@ cmd_update() {
 update_apply() {  # update_apply <tag> → 0 ok / 1 fail
     local version="$1"
     env_set ZAGROS_IMAGE_TAG "$version"
+    # Upgrade old installs to persistent built-in Xray paths without
+    # overwriting operator choices. These are non-secret defaults and must be
+    # present before compose replaces the old container layer.
+    case "$(env_get XRAY_JSON)" in
+        ""|./xray_config.json|xray_config.json)
+            env_set XRAY_JSON "/var/lib/zagros/cores/xray/xray_config.json" ;;
+    esac
+    case "$(env_get XRAY_EXECUTABLE_PATH)" in
+        ""|/usr/local/bin/xray|/usr/bin/xray)
+            env_set XRAY_EXECUTABLE_PATH "/var/lib/zagros/cores/xray/bin/xray" ;;
+    esac
+    case "$(env_get XRAY_ASSETS_PATH)" in
+        ""|/usr/local/share/xray|/usr/share/xray)
+            env_set XRAY_ASSETS_PATH "/var/lib/zagros/cores/xray/assets" ;;
+    esac
     # The compose TEMPLATE evolves between CLI releases (e.g. 1.0.0-alpha.7.2
     # added /dev/net/tun + NET_ADMIN so TUN-based cores — OpenVPN/WireGuard —
     # can start INSIDE the container). A running install's compose file is
@@ -1267,6 +1285,11 @@ do_backup() {  # do_backup [--logs|--no-logs] → echoes archive path
     (cd "$ZAGROS_DATA" && tar --exclude='./backups' \
         --exclude='./cores/*/bin' --exclude='./db' \
         --exclude='./logs' --exclude='./cores/*/assets' \
+        --exclude='./cores/softether/runtime/vpnserver' \
+        --exclude='./cores/softether/runtime/vpncmd' \
+        --exclude='./cores/softether/runtime/hamcore.se2' \
+        --exclude='./cores/softether/runtime/libcedar.so*' \
+        --exclude='./cores/softether/runtime/libmayaqua.so*' \
         --exclude='./zagros.db' --exclude='./zagros.db-*' \
         --exclude='./legacy.db' --exclude='./legacy.db-*' \
         -czf "$staging/data/panel-data.tar.gz" .)
@@ -1282,7 +1305,7 @@ panel=$(panel_version 2>/dev/null || echo unknown)
 image_tag=$(env_get ZAGROS_IMAGE_TAG)
 db_kind=$db_kind
 created_utc=$ts
-exclusions=cores/*/bin, cores/*/assets (self-installable), ./db (dumped separately), $( (( with_logs )) || echo "./logs," )./backups
+exclusions=cores/*/bin, cores/*/assets and SoftEther runtime binaries (self-installable; vpn_server.config retained), ./db (dumped separately), $( (( with_logs )) || echo "./logs," )./backups
 EOF
     write_manifest "$staging"
     tar -czf "$archive.tmp" -C "$staging" .
