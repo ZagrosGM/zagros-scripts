@@ -15,7 +15,7 @@ and messages — nothing is simulated; and the stack is **core-agnostic**: no
 core binary is baked into the image, every core self-installs its official
 upstream release at runtime, and no core has a special place anywhere.
 
-> **Status: ALPHA** (`v1.0.0-alpha.7.7`). Suitable for evaluation and lab
+> **Status: ALPHA** (`v1.0.0-alpha.7.8`). Suitable for evaluation and lab
 > testing. The CLI's semantics are covered by an end-to-end test suite
 > (`tests/`, 244 assertions) and the in-container bridge by the panel's
 > pytest suite — read *Verification* below honestly before production use.
