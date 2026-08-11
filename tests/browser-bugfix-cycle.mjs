@@ -1,4 +1,4 @@
-// Real Chromium UI regressions for the post-alpha.7.5 bug-fix cycle.
+// Real Chromium UI regressions for the post-alpha.7.6 bug-fix cycle.
 // API responses are deterministic browser fixtures; backend/runtime behavior
 // is covered by the Python integration and real-core gates.
 import { chromium } from "playwright";
@@ -52,6 +52,8 @@ const states = Object.fromEntries(users.map((user, index) => [
 const catalog = { groups: [
   { core_id: "xray", name: "Xray", enabled: true,
     inbounds: [{ tag: "vless-ws", protocol: "vless", port: 443 }] },
+  { core_id: "sing-box", name: "sing-box", enabled: true,
+    inbounds: [{ tag: "hy2-main", protocol: "hysteria2", port: 38473 }] },
   { core_id: "wireguard", name: "WireGuard", enabled: true,
     inbounds: [{ tag: "wg-main", protocol: "wireguard", port: 51820 }] },
 ] };
@@ -90,12 +92,31 @@ const softetherSchema = {
         { key: "ipsec_psk", label: "IPsec pre-shared key", type: "string", required: true,
           default: "A7sK2pQ9_", section: "general" },
       ] }] }] },
+    { id: "l2tp_raw", label: "L2TP RAW (no IPsec)", default_port: 1701,
+      transports: [{ id: "udp", label: "UDP 1701", securities: [{ id: "none", label: "None", fields: [] }] }] },
     { id: "sstp", label: "Microsoft SSTP compatibility", default_port: 443,
       transports: [{ id: "tcp", label: "HTTPS/TCP", securities: [{ id: "none", label: "None", fields: [] }] }] },
   ],
 };
 let createdUserPayload = null;
+let createdUserStatus = null;
 let previewPayload = null;
+
+// Browser fixture for the public, canonical subscription surface. The real
+// driver → portal host-resolution path is covered by Python integration and
+// real-core gates; this route covers what a user actually sees after opening
+// the copied /sub/<token> URL in Chromium.
+await page.route("**/sub/token-1", (route) => route.fulfill({
+  status: 200,
+  contentType: "text/html; charset=utf-8",
+  body: `<!doctype html><html lang="en"><head><title>Zagros subscription</title></head><body>
+    <main><h1>Subscription — user-1</h1>
+      <section data-core="sing-box"><h2>sing-box · Hysteria2</h2>
+        <code data-generated-link>hysteria2://secret@vpn.public.example:38473/?sni=vpn.public.example</code></section>
+      <section data-core="wireguard"><h2>WireGuard</h2>
+        <pre data-generated-link>[Interface]\nAddress = 10.88.0.2/32\n[Peer]\nEndpoint = vpn.public.example:51820</pre></section>
+    </main></body></html>`,
+}));
 
 await page.route("**/api/**", async (route) => {
   const request = route.request();
@@ -110,7 +131,14 @@ await page.route("**/api/**", async (route) => {
   if (request.method() === "GET" && path === "/zagros/inbounds") return json(route, catalog);
   if (request.method() === "POST" && path === "/user") {
     createdUserPayload = request.postDataJSON();
-    return json(route, { ...users[0], ...createdUserPayload, subscription_url: "/sub/new-token" });
+    const hasProxy = Object.keys(createdUserPayload?.proxies ?? {}).length > 0;
+    const hasCore = Object.values(createdUserPayload?.core_access ?? {})
+      .some((tags) => Array.isArray(tags) && tags.length > 0);
+    createdUserStatus = hasProxy || hasCore ? 200 : 422;
+    return json(route, createdUserStatus === 200
+      ? { ...users[0], ...createdUserPayload, subscription_url: "/sub/new-token" }
+      : { detail: "Each user needs at least one Xray proxy or one core_access inbound" },
+    createdUserStatus);
   }
   if (request.method() === "GET" && path === "/zagros/cores") return json(route, { cores: coreRows });
   if (request.method() === "GET" && path === "/zagros/studio/xray/raw") return json(route, { core_id: "xray", json: "{\"inbounds\":[]}" });
@@ -122,6 +150,14 @@ await page.route("**/api/**", async (route) => {
   if (request.method() === "GET" && path === "/zagros/cores/xray/hosts") return json(route, {
     "vless-ws": [{ remark: "🛸 Zagros ({USERNAME}) [{PROTOCOL} - {TRANSPORT}]", address: "{SERVER_IP}", port: null,
       sni: "", host: "", path: "", security: "inbound_default", alpn: "", fingerprint: "", is_disabled: false }],
+  });
+  if (request.method() === "GET" && path === "/zagros/cores/sing-box/hosts") return json(route, {
+    "hy2-main": [{ remark: "🛸 Zagros ({USERNAME}) [Hysteria2]", address: "{SERVER_IP}", port: null,
+      sni: "", allowinsecure: false, is_disabled: false }],
+  });
+  if (request.method() === "GET" && path === "/zagros/cores/sing-box/hosts/schema") return json(route, {
+    engine: "sing-box", inbounds: [{ tag: "hy2-main", protocol: "hysteria2",
+      fields: ["remark", "address", "port", "sni", "allowinsecure", "is_disabled"] }],
   });
   if (request.method() === "GET" && path === "/zagros/cores/wireguard/hosts") return json(route, {
     "wg-main": [{ remark: "🛸 Zagros ({USERNAME}) [{PROTOCOL} - {TRANSPORT}]", address: "{SERVER_IP}", port: null, is_disabled: false }],
@@ -173,8 +209,10 @@ const saveUser = userDialog.getByRole("button", { name: /^Save$/i });
 ok("template user: Save enabled", !(await saveUser.isDisabled()));
 await saveUser.click();
 await page.waitForTimeout(300);
+ok("template user: real create contract does not return 422", createdUserStatus === 200,
+  `status=${createdUserStatus}`);
 ok("template user: API payload grants selected core", createdUserPayload?.core_access?.wireguard?.[0] === "wg-main");
-ok("template user: username policy applied", /^tpl-.+-z$/.test(createdUserPayload?.username || ""), createdUserPayload?.username || "");
+ok("template user: username policy applied", /^tpl_.+_z$/.test(createdUserPayload?.username || ""), createdUserPayload?.username || "");
 
 // Old portal issuer UI is absent even in Edit User.
 await page.locator('[role="row"][data-index="0"]').click();
@@ -185,6 +223,7 @@ await page.keyboard.press("Escape");
 
 // Manual user creation still follows the independent manual selection path.
 createdUserPayload = null;
+createdUserStatus = null;
 await page.getByRole("button", { name: "New user" }).click();
 const manualDialog = page.getByRole("dialog");
 await manualDialog.locator("#username").fill("manual-browser-user");
@@ -202,9 +241,17 @@ const hostPageText = (await page.locator("main").innerText()).slice(0, 500);
 ok("hosts: Zagros default remark present", hostValues.some((value) => value.includes("🛸 Zagros")), JSON.stringify(hostValues) + " / " + hostPageText);
 ok("hosts: SERVER_IP default address present", hostValues.includes("{SERVER_IP}"), JSON.stringify(hostValues) + " / " + hostPageText);
 const hostsCoreSelect = page.locator("main select").first();
+await hostsCoreSelect.selectOption("sing-box");
+await page.getByText("hy2-main", { exact: true }).waitFor();
+const singBoxHostsBody = await page.locator("main").innerText();
+const singBoxHostValues = await page.locator("main input").evaluateAll((inputs) => inputs.map((input) => input.value));
+ok("hosts: sing-box Host Settings render the Hysteria2 inbound", /hy2-main/.test(singBoxHostsBody));
+ok("hosts: sing-box preserves the public {SERVER_IP} delivery variable",
+  singBoxHostValues.includes("{SERVER_IP}"), JSON.stringify(singBoxHostValues));
 await hostsCoreSelect.selectOption("wireguard");
-await page.waitForTimeout(350);
+await page.getByText("wg-main", { exact: true }).waitFor();
 const hostsBody = await page.locator("main").innerText();
+ok("hosts: WireGuard Host Settings render the inbound", /wg-main/.test(hostsBody));
 ok("hosts: WireGuard hides Xray TLS identity fields", !/\bSNI\b|\bALPN\b|fingerprint|allowInsecure|Security/i.test(hostsBody));
 
 // Inbound TLS certificate section follows security state exactly.
@@ -249,6 +296,16 @@ await coreSelect.selectOption("softether");
 await page.waitForTimeout(300);
 await page.getByRole("button", { name: /add inbound/i }).first().click();
 wizard = page.getByRole("dialog");
+// The dialog mounts before its core-specific schema request resolves. Wait on
+// a schema-backed choice so this assertion measures the rendered SoftEther
+// blueprint instead of the empty loading frame.
+const rawTransport = wizard.getByRole("button", { name: /L2TP RAW/i });
+await rawTransport.waitFor();
+const rawTransportCount = await rawTransport.count();
+ok("SoftEther wizard: L2TP RAW transport is exposed",
+  rawTransportCount >= 1, `count=${rawTransportCount}`);
+ok("SoftEther wizard: unsupported PPTP is absent",
+  await wizard.getByRole("button", { name: /PPTP/i }).count() === 0);
 await wizard.getByRole("button", { name: /L2TP\/IPsec/i }).click();
 await wizard.getByRole("button", { name: /continue/i }).click();
 await wizard.getByRole("button", { name: /continue/i }).click();
@@ -267,6 +324,22 @@ await wizard.getByRole("button", { name: /continue/i }).click();
 await wizard.getByRole("button", { name: /^None$/i }).click();
 await wizard.getByRole("button", { name: /continue/i }).click();
 ok("SoftEther SSTP: no IPsec PSK field", !(await wizard.locator('[data-generated-secret="ipsec_psk"]').count()));
+
+// Follow the exact link copied from Users into the public subscription page.
+// Browser coverage checks the user-visible portal contract; the production
+// host resolver behind these artifacts is exercised separately without mocks.
+await page.goto(copiedSubscription, { waitUntil: "domcontentloaded" });
+await page.locator("[data-generated-link]").first().waitFor();
+const portalText = await page.locator("main").innerText();
+const generatedLinks = await page.locator("[data-generated-link]").allInnerTexts();
+ok("subscription portal: canonical user page opens", /Subscription — user-1/.test(portalText));
+ok("subscription portal: sing-box and WireGuard artifacts are present",
+  /sing-box/.test(portalText) && /WireGuard/.test(portalText));
+ok("subscription portal: generated user links never contain loopback",
+  generatedLinks.length === 2 && generatedLinks.every((value) => !/127\.0\.0\.1|localhost/i.test(value)),
+  JSON.stringify(generatedLinks));
+ok("subscription portal: generated user links use the public host",
+  generatedLinks.every((value) => value.includes("vpn.public.example")), JSON.stringify(generatedLinks));
 
 ok("browser console: no errors", consoleErrors.length === 0, consoleErrors.slice(0, 3).join(" | "));
 await browser.close();
