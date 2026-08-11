@@ -1,4 +1,4 @@
-// Real Chromium UI regressions for the post-alpha.7.6 bug-fix cycle.
+// Real Chromium UI regressions for the post-alpha.7.7 bug-fix cycle.
 // API responses are deterministic browser fixtures; backend/runtime behavior
 // is covered by the Python integration and real-core gates.
 import { chromium } from "playwright";
