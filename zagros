@@ -1772,12 +1772,12 @@ cmd_doctor() {
 cmd_repair() {
     require_root; require_installed
     log_step "Zagros repair — persistent state + listener reconciliation"
-    local changed=0 backup_path="" h db_kind old_hash="" new_hash
+    local backup_path="" h db_kind old_hash="" new_hash
     local rollback_dir="$STATE_DIR/repair-rollback.$$"
 
     if ! docker info >/dev/null 2>&1; then
         if command -v systemctl >/dev/null 2>&1; then
-            systemctl start docker && dr_log "started docker daemon" && changed=1
+            systemctl start docker && dr_log "started docker daemon"
         fi
         docker info >/dev/null 2>&1 || die "docker daemon is not running and could not be started"
     fi
@@ -1812,7 +1812,7 @@ cmd_repair() {
         if [[ -n "$(find "$ZAGROS_DATA" -maxdepth 1 -name 'zagros.db' -print -quit 2>/dev/null)" ]]; then
             log_warn "ZAGROS_SECRET_KEY missing but a database exists — NOT inventing a new key (encrypted data would become unreadable). Restore it from backup."
         else
-            env_set ZAGROS_SECRET_KEY "$(gen_secret 32)"; changed=1
+            env_set ZAGROS_SECRET_KEY "$(gen_secret 32)"
         fi
     fi
     for k in ZAGROS_DB_KIND UVICORN_PORT ZAGROS_IMAGE_TAG; do
@@ -1822,7 +1822,7 @@ cmd_repair() {
                 UVICORN_PORT)     env_set "$k" 8000 ;;
                 ZAGROS_IMAGE_TAG) env_set "$k" "$(resolve_version latest)" ;;
             esac
-            log_ok "repaired missing key $k"; changed=1
+            log_ok "repaired missing key $k"
         fi
     done
     ensure_persistent_core_paths
@@ -1831,7 +1831,7 @@ cmd_repair() {
     [[ -f "$COMPOSE_FILE" ]] && old_hash="$(sha256sum "$COMPOSE_FILE" | cut -d' ' -f1)"
     render_compose "$db_kind"
     new_hash="$(sha256sum "$COMPOSE_FILE" | cut -d' ' -f1)"
-    [[ "$old_hash" == "$new_hash" ]] || { log_ok "compose definition re-rendered"; changed=1; }
+    [[ "$old_hash" == "$new_hash" ]] || log_ok "compose definition re-rendered"
 
     if ! docker image inspect "$IMAGE_REPO:$(env_get ZAGROS_IMAGE_TAG)" >/dev/null 2>&1; then
         log_info "image missing — pulling $IMAGE_REPO:$(env_get ZAGROS_IMAGE_TAG)"
@@ -1866,7 +1866,6 @@ cmd_repair() {
         compose up -d --force-recreate "$SERVICE" >/dev/null 2>&1 || true
         die "panel recreation failed; host configuration rolled back${backup_path:+ (data backup: $backup_path)}"
     fi
-    changed=1
     if ! wait_healthy "$SERVICE" 240; then
         log_err "panel did not become healthy after repair${backup_path:+; safety backup: $backup_path}"
         return 1
@@ -1900,7 +1899,7 @@ cmd_repair() {
 
     jq -r '.cores[] | select(.enabled == true) |
         "  reconciled \(.id): \(.state) / \(.health)"' "$report"
-    [[ -x "$ZAGROS_BIN/zagros" ]] || { install_cli_file; changed=1; }
+    [[ -x "$ZAGROS_BIN/zagros" ]] || install_cli_file
     rm -rf "$rollback_dir"
     log_ok "repair finished — configs, ownership, schema, accounts and listeners reconciled"
     cmd_health
