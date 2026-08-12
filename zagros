@@ -24,7 +24,7 @@
 # =============================================================================
 set -euo pipefail
 
-ZAGROS_CLI_VERSION="1.0.0-alpha.7.8"
+ZAGROS_CLI_VERSION="1.0.0-alpha.7.9"
 SCRIPTS_REPO_RAW="https://raw.githubusercontent.com/ZagrosGM/zagros-scripts"
 PANEL_REPO="ZagrosGM/Zagros"
 PANEL_API="https://api.github.com/repos/${PANEL_REPO}"
@@ -1036,12 +1036,9 @@ cmd_update() {
     fi
 }
 
-update_apply() {  # update_apply <tag> → 0 ok / 1 fail
-    local version="$1"
-    env_set ZAGROS_IMAGE_TAG "$version"
-    # Upgrade old installs to persistent built-in Xray paths without
-    # overwriting operator choices. These are non-secret defaults and must be
-    # present before compose replaces the old container layer.
+ensure_persistent_core_paths() {
+    # Upgrade historical image-local defaults without overwriting deliberate
+    # operator paths. Called by both update and repair before any recreation.
     case "$(env_get XRAY_JSON)" in
         ""|./xray_config.json|xray_config.json)
             env_set XRAY_JSON "/var/lib/zagros/cores/xray/xray_config.json" ;;
@@ -1054,6 +1051,12 @@ update_apply() {  # update_apply <tag> → 0 ok / 1 fail
         ""|/usr/local/share/xray|/usr/share/xray)
             env_set XRAY_ASSETS_PATH "/var/lib/zagros/cores/xray/assets" ;;
     esac
+}
+
+update_apply() {  # update_apply <tag> → 0 ok / 1 fail
+    local version="$1"
+    env_set ZAGROS_IMAGE_TAG "$version"
+    ensure_persistent_core_paths
     # The compose TEMPLATE evolves between CLI releases (e.g. 1.0.0-alpha.7.2
     # added /dev/net/tun + NET_ADMIN so TUN-based cores — OpenVPN/WireGuard —
     # can start INSIDE the container). A running install's compose file is
@@ -1768,8 +1771,9 @@ cmd_doctor() {
 # ----------------------------------------------------------------- repair ---#
 cmd_repair() {
     require_root; require_installed
-    log_step "Zagros repair — safe automatic fixes"
-    local changed=0
+    log_step "Zagros repair — persistent state + listener reconciliation"
+    local changed=0 backup_path="" h db_kind old_hash="" new_hash
+    local rollback_dir="$STATE_DIR/repair-rollback.$$"
 
     if ! docker info >/dev/null 2>&1; then
         if command -v systemctl >/dev/null 2>&1; then
@@ -1780,17 +1784,35 @@ cmd_repair() {
     compose_probe
 
     mkdir -p "$ZAGROS_HOME" "$STATE_DIR" "$ZAGROS_DATA" "$BACKUP_DIR" \
-             "$ZAGROS_DATA/cores" "$ZAGROS_DATA/logs"
+             "$ZAGROS_DATA/cores" "$ZAGROS_DATA/logs" "$ZAGROS_DATA/cache"
     chmod 700 "$ZAGROS_HOME" "$STATE_DIR"
+    chmod 755 "$ZAGROS_DATA" "$ZAGROS_DATA/cores" "$ZAGROS_DATA/logs" "$ZAGROS_DATA/cache"
+    chown -R root:root "$ZAGROS_DATA/cores" "$ZAGROS_DATA/logs" 2>/dev/null \
+        || log_warn "could not normalize every core/log owner (filesystem policy); continuing with mode and runtime checks"
 
-    [[ -f "$ENV_FILE" ]] || die "$ENV_FILE missing — repair cannot invent configuration; reinstall (zagros install) after removing $(dirname "$ENV_FILE")."
+    [[ -f "$ENV_FILE" ]] || die "$ENV_FILE missing — repair cannot invent configuration; restore it from backup."
     chmod 600 "$ENV_FILE"
+    mkdir -p "$rollback_dir"
+    cp -a "$ENV_FILE" "$rollback_dir/.env"
+    [[ -f "$COMPOSE_FILE" ]] && cp -a "$COMPOSE_FILE" "$rollback_dir/docker-compose.yml"
+
+    # A repair is intentionally mutating; take a consistent safety archive
+    # before re-render/recreate. No database, credential, or account is deleted.
+    h="$(docker inspect --format '{{if .State.Health}}{{.State.Health.Status}}{{else}}{{.State.Status}}{{end}}' "$SERVICE" 2>/dev/null || echo missing)"
+    if [[ "$h" == "healthy" || "$h" == "running" ]]; then
+        log_step "Pre-repair safety backup"
+        backup_path="$(do_backup --no-logs)" \
+            || die "pre-repair backup failed — refusing to mutate runtime"
+        log_ok "safety backup: $backup_path"
+    else
+        log_warn "panel is not running ($h); config snapshots exist, but a hot-consistent DB backup was not possible"
+    fi
 
     if ! grep -qE '^ZAGROS_SECRET_KEY=.+' "$ENV_FILE"; then
         if [[ -n "$(find "$ZAGROS_DATA" -maxdepth 1 -name 'zagros.db' -print -quit 2>/dev/null)" ]]; then
-            log_warn "ZAGROS_SECRET_KEY missing but a database exists — NOT inventing a new key (encrypted data would become unreadable). Restore the key from a backup, or wipe and reinstall."
+            log_warn "ZAGROS_SECRET_KEY missing but a database exists — NOT inventing a new key (encrypted data would become unreadable). Restore it from backup."
         else
-            env_set ZAGROS_SECRET_KEY "$(gen_secret 32)"; log_ok "generated missing ZAGROS_SECRET_KEY (fresh install)"; changed=1
+            env_set ZAGROS_SECRET_KEY "$(gen_secret 32)"; changed=1
         fi
     fi
     for k in ZAGROS_DB_KIND UVICORN_PORT ZAGROS_IMAGE_TAG; do
@@ -1803,36 +1825,85 @@ cmd_repair() {
             log_ok "repaired missing key $k"; changed=1
         fi
     done
+    ensure_persistent_core_paths
+
+    db_kind="$(env_get ZAGROS_DB_KIND)"; db_kind="${db_kind:-sqlite}"
+    [[ -f "$COMPOSE_FILE" ]] && old_hash="$(sha256sum "$COMPOSE_FILE" | cut -d' ' -f1)"
+    render_compose "$db_kind"
+    new_hash="$(sha256sum "$COMPOSE_FILE" | cut -d' ' -f1)"
+    [[ "$old_hash" == "$new_hash" ]] || { log_ok "compose definition re-rendered"; changed=1; }
 
     if ! docker image inspect "$IMAGE_REPO:$(env_get ZAGROS_IMAGE_TAG)" >/dev/null 2>&1; then
         log_info "image missing — pulling $IMAGE_REPO:$(env_get ZAGROS_IMAGE_TAG)"
-        compose pull && changed=1
+        compose pull >/dev/null || {
+            cp -a "$rollback_dir/.env" "$ENV_FILE"
+            [[ -f "$rollback_dir/docker-compose.yml" ]] && cp -a "$rollback_dir/docker-compose.yml" "$COMPOSE_FILE"
+            die "image pull failed; host configuration rolled back"
+        }
     fi
 
-    local h
-    h="$(docker inspect --format '{{if .State.Health}}{{.State.Health.Status}}{{else}}{{.State.Status}}{{end}}' "$SERVICE" 2>/dev/null || echo missing)"
-    if [[ "$h" != "healthy" && "$h" != "running" ]]; then
-        log_info "container not healthy ($h) — recreating"
-        compose up -d --force-recreate "$SERVICE" >/dev/null && changed=1
-    fi
-    if [[ "$(env_get ZAGROS_DB_KIND)" != "sqlite" ]]; then
-        h="$(docker inspect --format '{{if .State.Health}}{{.State.Health.Status}}{{else}}{{.State.Status}}{{end}}' "$DB_SERVICE" 2>/dev/null || echo missing)"
-        if [[ "$h" != "healthy" && "$h" != "running" ]]; then
-            compose up -d "$DB_SERVICE" >/dev/null && changed=1
-            wait_healthy "$DB_SERVICE" 150 && provision_legacy_db && changed=1
-        fi
+    # Invalidate only interrupted/generated cache fragments. Stable binaries,
+    # certificates, SQL, Studio documents and account credentials are retained.
+    find "$ZAGROS_DATA/cores" "$ZAGROS_DATA/cache" -type f \
+        \( -name '*.part' -o -name '*.tmp' -o -name '*.swap' \) \
+        -mmin +30 -delete 2>/dev/null || true
+    command -v systemctl >/dev/null 2>&1 && systemctl daemon-reload || true
+
+    if [[ "$db_kind" != "sqlite" ]]; then
+        compose up -d "$DB_SERVICE" >/dev/null || die "database service could not start"
+        wait_healthy "$DB_SERVICE" 150 || die "database service did not become healthy"
+        provision_legacy_db
     fi
 
-    log_step "schema verification"
+    # Remove the previous verdict and force one clean process generation.
+    # The live panel boot re-renders Studio docs, replays encrypted accounts,
+    # replaces stale host-network interfaces, and atomically writes a new report.
+    rm -f "$ZAGROS_DATA/runtime-boot-report.json"
+    log_step "Recreate panel and reconcile every listener/account"
+    if ! compose up -d --force-recreate "$SERVICE" >/dev/null; then
+        cp -a "$rollback_dir/.env" "$ENV_FILE"
+        [[ -f "$rollback_dir/docker-compose.yml" ]] && cp -a "$rollback_dir/docker-compose.yml" "$COMPOSE_FILE"
+        compose up -d --force-recreate "$SERVICE" >/dev/null 2>&1 || true
+        die "panel recreation failed; host configuration rolled back${backup_path:+ (data backup: $backup_path)}"
+    fi
+    changed=1
+    if ! wait_healthy "$SERVICE" 240; then
+        log_err "panel did not become healthy after repair${backup_path:+; safety backup: $backup_path}"
+        return 1
+    fi
+
+    log_step "Schema + live reconciliation verdict"
     panel_exec python3 -m alembic upgrade head >/dev/null \
-        && log_ok "schema at head" \
-        || log_warn "migration had issues — check zagros migrate output"
+        || { log_err "schema migration failed${backup_path:+; safety backup: $backup_path}"; return 1; }
 
+    local report="$ZAGROS_DATA/runtime-boot-report.json" ready=0
+    for _ in $(seq 1 120); do
+        [[ -s "$report" ]] && { ready=1; break; }
+        sleep 1
+    done
+    if (( ! ready )); then
+        log_err "live panel produced no runtime reconciliation report${backup_path:+; safety backup: $backup_path}"
+        return 1
+    fi
+    if ! jq -e '
+        (.studio_deferred | length) == 0 and
+        (.account_deferred | length) == 0 and
+        ([.cores[] | select(.enabled == true and .state != "running")] | length) == 0
+    ' "$report" >/dev/null; then
+        log_err "runtime reconciliation is incomplete:"
+        jq '{studio_deferred, account_deferred,
+             failed_cores: [.cores[] | select(.enabled == true and .state != "running")]}' \
+            "$report" >&2
+        log_err "no data was deleted${backup_path:+; safety backup: $backup_path}"
+        return 1
+    fi
+
+    jq -r '.cores[] | select(.enabled == true) |
+        "  reconciled \(.id): \(.state) / \(.health)"' "$report"
     [[ -x "$ZAGROS_BIN/zagros" ]] || { install_cli_file; changed=1; }
-
-    if (( changed == 0 )); then log_ok "nothing needed repair — system looks consistent"
-    else log_ok "repair finished" ; fi
-    cmd_health || true
+    rm -rf "$rollback_dir"
+    log_ok "repair finished — configs, ownership, schema, accounts and listeners reconciled"
+    cmd_health
 }
 dr_log() { printf '%s\n' "$*"; }
 

@@ -423,8 +423,18 @@ run bash "$CLI" up
 # ----------------------------------------------------------------------------- #
 say "t15 repair fixes drift, guards the secret key"
 sed -i '/^UVICORN_PORT=/d' "$ZAGROS_HOME/.env"
+mkdir -p "$ZAGROS_DATA/cache"; touch -d '2 hours ago' "$ZAGROS_DATA/cache/orphan.part"
 run bash "$CLI" repair
 expect_rc "repair rc0" 0
+expect_out "repair reconciles live core verdict" "reconciled wireguard: running"
+grep -q 'force-recreate' "$FAKE_DOCKER_STATE/invocations.jsonl" \
+    && ok "repair force-recreates panel for listener reconciliation" \
+    || bad "repair force-recreates panel for listener reconciliation"
+[[ ! -e "$ZAGROS_DATA/cache/orphan.part" ]] \
+    && ok "repair invalidates stale partial cache" || bad "repair invalidates stale partial cache"
+jq -e '(.studio_deferred|length)==0 and (.account_deferred|length)==0' \
+    "$ZAGROS_DATA/runtime-boot-report.json" >/dev/null \
+    && ok "repair consumes clean live boot report" || bad "repair consumes clean live boot report"
 grep -q '^UVICORN_PORT=8000$' "$ZAGROS_HOME/.env" \
     && ok "repair re-added missing UVICORN_PORT" || bad "repair re-added missing UVICORN_PORT"
 SECRET_LINE="$(grep '^ZAGROS_SECRET_KEY=' "$ZAGROS_HOME/.env")"

@@ -88,16 +88,29 @@ def container_running(name: str) -> bool:
 
 
 def panel_boot_effects() -> None:
-    """The real panel boots enabled+installed cores on startup → mark them
-    running (this is what makes per-core lifecycle PANEL_OWNED afterwards)."""
+    """The real panel boots/reconciles enabled cores and writes its verdict."""
     cores = load("cores.json", {})
     changed = False
     for cid, c in cores.items():
-        if c.get("enabled", True) and c.get("state") == "installed":
+        if c.get("enabled", True) and c.get("state") in ("installed", "stopped", "error"):
             c["state"] = "running"
             changed = True
     if changed:
         save("cores.json", cores)
+    data = pathlib.Path(os.environ.get("ZAGROS_DATA", "/var/lib/zagros"))
+    data.mkdir(parents=True, exist_ok=True)
+    report = {
+        "generated_at": int(time.time()),
+        "studio_deferred": [],
+        "account_deferred": [],
+        "cores": [
+            {"id": cid, "enabled": bool(c.get("enabled", True)),
+             "state": c.get("state", "installed"), "health": "healthy",
+             "version": c.get("version"), "message": None}
+            for cid, c in sorted(cores.items())
+        ],
+    }
+    (data / "runtime-boot-report.json").write_text(json.dumps(report))
 
 
 # --------------------------------------------------------------------------- #
