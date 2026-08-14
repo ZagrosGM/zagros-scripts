@@ -56,6 +56,11 @@ jobs:
           test "$(sudo zagros config get UVICORN_HOST)" = "0.0.0.0"
           sudo ss -lntp | grep -q '0.0.0.0:8000'
           curl -fsS "http://127.0.0.1:8000/dashboard/" -o /dev/null -w 'bind check on .0:8000: %{http_code}\n'
+          # Panel Network Apply is honest only when the root host watcher is
+          # actually active; copied files alone must never create readiness.
+          sudo test -x /usr/local/libexec/zagros-host-agent
+          sudo systemctl is-active --quiet zagros-host-agent.path
+          sudo test -f /var/lib/zagros/host-actions/.agent-ready
 
       - name: first sudo admin + probes
         run: |
@@ -178,6 +183,7 @@ jobs:
           test ! -e /var/lib/zagros
           test ! -e /etc/zagros
           test ! -e /usr/local/bin/zagros
+          test ! -e /usr/local/libexec/zagros-host-agent
           echo "CLEAN: system looks like Zagros was never installed ✓"
 
       - name: reinstall — fresh install must work with zero leftovers (checklist #15-16)

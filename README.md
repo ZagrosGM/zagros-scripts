@@ -7,6 +7,9 @@ management platform.
 * `zagros.sh` — thin bootstrap (curl → CLI → run), the one-liner entrypoint.
 * `zagros` — the self-contained management CLI. Once installed it lives at
   `/usr/local/bin/zagros` and never depends on this repository being present.
+* `zagros-host-agent` — the root-only systemd path worker for atomic Panel
+  Network Apply, HTTPS health verification and `.env` rollback. The web
+  container never receives the Docker socket.
 
 Design rules: everything the CLI does is **real** (docker/compose for the
 service lifecycle, `python3 -m app.platform.hostctl` inside the container for
@@ -15,9 +18,9 @@ and messages — nothing is simulated; and the stack is **core-agnostic**: no
 core binary is baked into the image, every core self-installs its official
 upstream release at runtime, and no core has a special place anywhere.
 
-> **Status: ALPHA** (`v1.0.0-alpha.8.1`). Suitable for evaluation and lab
+> **Status: ALPHA** (`v1.0.0-alpha.8.2`). Suitable for evaluation and lab
 > testing. The CLI's semantics are covered by an end-to-end test suite
-> (`tests/`, 254 assertions) and the in-container bridge by the panel's
+> (`tests/`, 263 assertions) and the in-container bridge by the panel's
 > pytest suite — read *Verification* below honestly before production use.
 
 ---
@@ -44,6 +47,17 @@ sudo zagros doctor                    # full diagnostic report
 sudo zagros install-core xray         # self-install an official core binary
 ```
 
+### Safe update (refresh host scripts before the image)
+
+```bash
+sudo bash -c "$(curl -fsSL https://raw.githubusercontent.com/ZagrosGM/zagros-scripts/main/zagros.sh)" -- update --version v1.0.0-alpha.8.2
+```
+
+Using the bootstrap for an update is intentional: it installs the current CLI,
+host agent and compose healthcheck before pulling/recreating the requested
+Panel image. Calling an older already-installed CLI cannot retroactively know
+about newer host-side lifecycle hooks.
+
 **The panel (exactly one):** `http://<server-ip>:8000/dashboard/` — the unified
 Zagros dashboard. Cores, routing, outbounds, inbounds, DNS, certificates,
 sessions and devices are all managed there, and the Config Studio lives
@@ -66,7 +80,10 @@ removed in `v1.0.0-alpha.5` and return 404).
    the second `zagros_legacy` database (split-schema design).
 5. Waits for panel health, runs `alembic upgrade head`, verifies the schema
    is at head.
-6. Installs the CLI to `/usr/local/bin/zagros`.
+6. Installs the CLI to `/usr/local/bin/zagros` and, on systemd hosts, activates
+   `/usr/local/libexec/zagros-host-agent` plus its path unit. If systemd
+   activation is unavailable, Panel Network desired state can still be saved
+   and tested, but Apply remains explicitly disabled (no false-ready marker).
 
 ### Requirements
 
@@ -81,6 +98,8 @@ ones are auto-installed from your distro packages when possible.
 | `/opt/zagros` | `ZAGROS_HOME` | compose file, **`.env`** (THE configuration), CLI state |
 | `/var/lib/zagros` | `ZAGROS_DATA` | databases (sqlite), cores, backups, logs, certs, keys |
 | `/usr/local/bin` | `ZAGROS_BIN` | the `zagros` CLI |
+| `/usr/local/libexec` | `ZAGROS_LIBEXEC` | root-only `zagros-host-agent` |
+| `/etc/systemd/system` | `SYSTEMD_DIR` | host-agent `.service` and `.path` units |
 
 Images come **exclusively from GHCR** (`ghcr.io/zagrosgm/zagros`). Docker Hub
 is not used.
@@ -137,7 +156,7 @@ CLI cheatsheet: `zagros config show` (masked overview) ·
 | `logs [zagros\|zagros-db] [--tail N] [--no-follow]` | Service logs (follows by default). |
 | `shell` | `exec` into the panel container (`bash`, falls back to `sh`). |
 | `version` | CLI, image tag, panel version, newest release. |
-| `uninstall [-y]` | **Full uninstall** — destroys everything: containers, panel+DB images, volumes, networks, systemd units, cron jobs, `/opt/zagros`, `/var/lib/zagros` (databases, backups, certificates, logs, runtime data, caches), `/etc/zagros` and the CLI itself. Prints a removal summary first, then verifies nothing is left (second sweep + loud failure on any survivor). |
+| `uninstall [-y]` | **Full uninstall** — destroys everything: containers, panel+DB images, volumes, networks, systemd units, cron jobs, `/opt/zagros`, `/var/lib/zagros` (databases, backups, certificates, logs, runtime data, caches), `/etc/zagros`, the CLI and the root-only host agent. Prints a removal summary first, then verifies nothing is left (second sweep + loud failure on any survivor). |
 
 ### Operations
 
@@ -219,16 +238,17 @@ run `zagros backup` first regardless).
   explicitly pass `--no-backup`.
 * `repair` and `config set` refuse to auto-rotate `ZAGROS_SECRET_KEY` when a
   database exists (stored credentials would become unreadable).
-* The CLI installs exactly one file into `/usr/local/bin` and touches nothing
-  outside the paths documented above.
+* The installer adds only the documented CLI, root-only host agent and its two
+  systemd units outside the managed data/config trees. Full Uninstall removes
+  and verifies all of them.
 
 ---
 
 ## Verification (honest status)
 
-* **CI on this repo** (`ci.yml`): shellcheck (`-S warning`) for both scripts +
-  `bash tests/test_cli.sh` — an end-to-end harness that drives the **real**
-  CLI through 189 assertions (install → config → admin → cores → backup →
+* **CI on this repo** (`ci.yml`): ShellCheck (`-S warning`) for all three host
+  scripts + `bash tests/test_cli.sh` — an end-to-end harness that drives the
+  **real** CLI through 263 assertions (install → config → admin → cores → backup →
   restore → update → forced-failure rollback → doctor → repair → clean/prune
   → full uninstall & verification) against a faithful docker/compose/hostctl double
   (`tests/faked/`). GitHub runners additionally run the real-VPS E2E below.
