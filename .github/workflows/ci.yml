@@ -20,10 +20,10 @@ jobs:
           shellcheck --version
 
       - name: bash -n
-        run: bash -n zagros zagros.sh tests/test_cli.sh
+        run: bash -n zagros zagros-host-agent zagros.sh tests/test_cli.sh
 
       - name: shellcheck
-        run: shellcheck -x -S warning zagros zagros.sh
+        run: shellcheck -x -S warning zagros zagros-host-agent zagros.sh
 
   cli-tests:
     name: CLI end-to-end logic (docker-emulated harness)

@@ -6,6 +6,7 @@
 #    sudo bash -c "$(curl -fsSL \
 #      https://raw.githubusercontent.com/ZagrosGM/zagros-scripts/main/zagros.sh)" \
 #      -- install [--database sqlite|mysql|mariadb|postgresql] [--version <tag>]
+#    sudo bash -c "$(curl -fsSL <this-url>)" -- update [--version <tag>]
 #
 #  This file is intentionally thin: it fetches the full management CLI
 #  (`zagros`) matching the requested source ref and hands control to it, so
@@ -28,7 +29,7 @@ command -v curl >/dev/null 2>&1 || err "'curl' is required (apt/dnf/yum install 
 
 command="${1:-install}"
 [[ $# -gt 0 ]] && shift
-case "$command" in install) ;; uninstall) ;; *) err "usage: ... -- install|uninstall [options]" ;; esac
+case "$command" in install|update|uninstall) ;; *) err "usage: ... -- install|update|uninstall [options]" ;; esac
 
 tmp="$(mktemp /tmp/zagros-cli.XXXXXX)"
 trap 'rm -f "$tmp"' EXIT
@@ -40,4 +41,4 @@ chmod 0755 "$tmp"
 # ZAGROS_CLI_SELF lets the installer copy exactly this downloaded file into
 # place instead of fetching it again.
 export ZAGROS_CLI_SELF="$tmp"
-exec "$tmp" "$command" "$@"
+"$tmp" "$command" "$@"

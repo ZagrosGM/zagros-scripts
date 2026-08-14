@@ -21,10 +21,11 @@
 #   /opt/zagros          ZAGROS_HOME   compose file, env, CLI state
 #   /var/lib/zagros      ZAGROS_DATA   panel data, cores, backups, logs
 #   /usr/local/bin       ZAGROS_BIN    this CLI
+#   /usr/local/libexec   ZAGROS_LIBEXEC root-only Panel Network host agent
 # =============================================================================
 set -euo pipefail
 
-ZAGROS_CLI_VERSION="1.0.0-alpha.8.1"
+ZAGROS_CLI_VERSION="1.0.0-alpha.8.2"
 SCRIPTS_REPO_RAW="https://raw.githubusercontent.com/ZagrosGM/zagros-scripts"
 PANEL_REPO="ZagrosGM/Zagros"
 PANEL_API="https://api.github.com/repos/${PANEL_REPO}"
@@ -33,6 +34,7 @@ IMAGE_REPO="ghcr.io/zagrosgm/zagros"
 ZAGROS_HOME="${ZAGROS_HOME:-/opt/zagros}"
 ZAGROS_DATA="${ZAGROS_DATA:-/var/lib/zagros}"
 ZAGROS_BIN="${ZAGROS_BIN:-/usr/local/bin}"
+ZAGROS_LIBEXEC="${ZAGROS_LIBEXEC:-/usr/local/libexec}"
 # Config leftovers outside the managed dirs (overridable for tests).
 ZAGROS_ETC="${ZAGROS_ETC:-/etc/zagros}"
 # Service/cron locations swept by the full uninstall (overridable for tests).
@@ -301,7 +303,7 @@ services:
       - __DATA_DIR__:/var/lib/zagros
     healthcheck:
       # no env injection → the probe reads UVICORN_PORT from the mounted file
-      test: ["CMD", "python3", "-c", "import urllib.request;p=next((l.split('=',1)[1].strip().strip(chr(34)).strip(chr(39)) for l in open('/code/.env',encoding='utf-8') if l.split('=',1)[0].strip()=='UVICORN_PORT'),'8000');urllib.request.urlopen('http://127.0.0.1:'+str(int(p))+'/dashboard/',timeout=3).close()"]
+      test: ["CMD", "python3", "-c", "import ssl,urllib.request;d={l.split('=',1)[0].strip():l.split('=',1)[1].strip().strip(chr(34)).strip(chr(39)) for l in open('/code/.env',encoding='utf-8') if '=' in l and not l.lstrip().startswith('#')};p=str(int(d.get('UVICORN_PORT','8000')));m=d.get('TLS_MODE','auto');tls=m=='on' or (m=='auto' and bool(d.get('UVICORN_SSL_CERTFILE')) and bool(d.get('UVICORN_SSL_KEYFILE')));u=('https' if tls else 'http')+'://127.0.0.1:'+p+'/dashboard/';urllib.request.urlopen(u,timeout=3,context=ssl._create_unverified_context() if tls else None).close()"]
       interval: 20s
       timeout: 8s
       retries: 6
@@ -565,6 +567,71 @@ install_cli_file() {  # install_cli_file — place the running CLI into $ZAGROS_
     log_ok "CLI installed → $target"
 }
 
+install_host_agent_files() {
+    # The CLI harness relocates SYSTEMD_DIR into a sandbox. Do not contact the
+    # network or the real systemd daemon there; production uses the canonical
+    # path (manual tests may opt in explicitly).
+    if [[ "$SYSTEMD_DIR" != "/etc/systemd/system" && "${ZAGROS_FORCE_HOST_AGENT:-0}" != 1 ]]; then
+        log_info "host network agent skipped outside the production systemd path"
+        return 0
+    fi
+    local target="$ZAGROS_LIBEXEC/zagros-host-agent" source=""
+    mkdir -p "$ZAGROS_LIBEXEC" "$SYSTEMD_DIR" "$ZAGROS_DATA/host-actions"
+    chmod 700 "$ZAGROS_DATA/host-actions"
+    if [[ -r "$(dirname "${BASH_SOURCE[0]}")/zagros-host-agent" ]]; then
+        source="$(dirname "${BASH_SOURCE[0]}")/zagros-host-agent"
+        install -m 0755 "$source" "$target"
+    else
+        curl -fsSL "$SCRIPTS_REPO_RAW/$ZAGROS_SCRIPTS_REF/zagros-host-agent" -o "$target"
+        chmod 0755 "$target"
+    fi
+    cat > "$SYSTEMD_DIR/zagros-host-agent.service" <<EOF
+[Unit]
+Description=Zagros host network apply agent
+After=docker.service
+Requires=docker.service
+
+[Service]
+Type=oneshot
+ExecStart=$target
+EOF
+    cat > "$SYSTEMD_DIR/zagros-host-agent.path" <<EOF
+[Unit]
+Description=Watch Zagros host network requests
+
+[Path]
+PathChanged=$ZAGROS_DATA/host-actions/panel-network.request.json
+Unit=zagros-host-agent.service
+
+[Install]
+WantedBy=multi-user.target
+EOF
+    chmod 0644 "$SYSTEMD_DIR/zagros-host-agent.service" \
+        "$SYSTEMD_DIR/zagros-host-agent.path"
+    # Readiness is a runtime fact, not merely "files were copied". A stale
+    # marker on a non-systemd host would let the panel queue an operation that
+    # nobody can consume, leaving Apply pending forever.
+    rm -f "$ZAGROS_DATA/host-actions/.agent-ready"
+    if [[ "$SYSTEMD_DIR" == "/etc/systemd/system" ]] \
+            && command -v systemctl >/dev/null 2>&1 \
+            && [[ -d /run/systemd/system ]] \
+            && systemctl daemon-reload \
+            && systemctl enable --now zagros-host-agent.path >/dev/null \
+            && systemctl is-active --quiet zagros-host-agent.path; then
+        touch "$ZAGROS_DATA/host-actions/.agent-ready"
+        chmod 0600 "$ZAGROS_DATA/host-actions/.agent-ready"
+        log_ok "host network agent active (atomic Panel Network apply + rollback)"
+    else
+        log_warn "host network agent files installed but path watcher is inactive; Panel Network Apply stays disabled until systemd activation succeeds"
+    fi
+}
+
+cmd_install_host_agent() {
+    require_root
+    require_installed
+    install_host_agent_files
+}
+
 # --------------------------------------------------------------------------- #
 #  manifest helpers (backup)                                                  #
 # --------------------------------------------------------------------------- #
@@ -736,6 +803,7 @@ cmd_install() {
     log_ok "Schema up to date ($(printf '%s' "$check" | jq -r '.alembic_heads[0]'))"
 
     install_cli_file
+    install_host_agent_files
     printf '%s\n' "{\"version\": \"$version\", \"db\": \"$db_kind\", \"installed_utc\": \"$(date -u +%Y-%m-%dT%H:%M:%SZ)\"}" \
         > "$STATE_DIR/install.json"
 
@@ -776,15 +844,15 @@ EOF
 _u_systemd_units() {  # zagros*.service/timer files + registered units (always rc 0)
     {
         local f
-        for f in "$SYSTEMD_DIR"/zagros*.service "$SYSTEMD_DIR"/zagros*.timer; do
+        for f in "$SYSTEMD_DIR"/zagros*.service "$SYSTEMD_DIR"/zagros*.timer "$SYSTEMD_DIR"/zagros*.path; do
             [[ -e $f ]] && basename "$f"
         done 2>/dev/null
         if command -v systemctl >/dev/null 2>&1; then
             # systemctl errors when systemd is not booted (containers) and
             # prints prose like "0 unit files listed." — filter to real unit
             # names only and never propagate a nonzero status (pipefail).
-            systemctl list-unit-files 'zagros*.service' 'zagros*.timer' --no-legend 2>/dev/null \
-                | awk '{print $1}' | grep -E '^zagros.*\.(service|timer)$' || true
+            systemctl list-unit-files 'zagros*.service' 'zagros*.timer' 'zagros*.path' --no-legend 2>/dev/null \
+                | awk '{print $1}' | grep -E '^zagros.*\.(service|timer|path)$' || true
         fi
     } | sort -u
     return 0
@@ -825,6 +893,7 @@ The following will be PERMANENTLY destroyed (full uninstall):
   logs:          panel + core logs under $ZAGROS_DATA
   backups:       $ZAGROS_DATA/backups (all backup archives)
   CLI:           $ZAGROS_BIN/zagros (+ ${cache} cache dir)
+  host agent:    $ZAGROS_LIBEXEC/zagros-host-agent
 Afterwards the system must look like Zagros was never installed.
 EOF
 }
@@ -893,8 +962,9 @@ uninstall_filesystem_sweep() {
                             # certificates, TLS keys, runtime data, logs, backups, cache
     rm -rf "$ZAGROS_ETC"     # legacy/config leftovers where present
     rm -f  "$ZAGROS_BIN/zagros"
+    rm -f  "$ZAGROS_LIBEXEC/zagros-host-agent"
     rm -rf "$HOME/.cache/zagros"   # CLI cache (only the exact known dir — never globs)
-    log_ok "removed $ZAGROS_HOME, $ZAGROS_DATA, $ZAGROS_ETC, units, cron jobs, cache and the CLI"
+    log_ok "removed $ZAGROS_HOME, $ZAGROS_DATA, $ZAGROS_ETC, units, cron jobs, cache, CLI and host agent"
 }
 
 uninstall_verify() {
@@ -917,6 +987,7 @@ uninstall_verify() {
     [[ -e "$ZAGROS_DATA" ]] && leftovers+=("$ZAGROS_DATA")
     [[ -e "$ZAGROS_ETC" ]] && leftovers+=("$ZAGROS_ETC")
     [[ -e "$ZAGROS_BIN/zagros" ]] && leftovers+=("$ZAGROS_BIN/zagros")
+    [[ -e "$ZAGROS_LIBEXEC/zagros-host-agent" ]] && leftovers+=("$ZAGROS_LIBEXEC/zagros-host-agent")
     [[ -e "$HOME/.cache/zagros" ]] && leftovers+=("$HOME/.cache/zagros")
 
     if ((${#leftovers[@]})); then
@@ -946,13 +1017,14 @@ uninstall_verify() {
             systemctl daemon-reload >/dev/null 2>&1 || true
         fi
         rm -rf "$ZAGROS_HOME" "$ZAGROS_DATA" "$ZAGROS_ETC" "$HOME/.cache/zagros"
-        rm -f "$ZAGROS_BIN/zagros"
+        rm -f "$ZAGROS_BIN/zagros" "$ZAGROS_LIBEXEC/zagros-host-agent"
         # final re-check — honesty: fail loudly instead of claiming success
         leftovers=()
         [[ -e "$ZAGROS_HOME" ]] && leftovers+=("$ZAGROS_HOME")
         [[ -e "$ZAGROS_DATA" ]] && leftovers+=("$ZAGROS_DATA")
         [[ -e "$ZAGROS_ETC" ]] && leftovers+=("$ZAGROS_ETC")
         [[ -e "$ZAGROS_BIN/zagros" ]] && leftovers+=("$ZAGROS_BIN/zagros")
+        [[ -e "$ZAGROS_LIBEXEC/zagros-host-agent" ]] && leftovers+=("$ZAGROS_LIBEXEC/zagros-host-agent")
         [[ -e "$HOME/.cache/zagros" ]] && leftovers+=("$HOME/.cache/zagros")
         [[ $(docker ps -a --format '{{.Names}}' 2>/dev/null | grep -c '^zagros' || true) == "0" ]] \
             || leftovers+=("docker containers")
@@ -960,7 +1032,7 @@ uninstall_verify() {
         [[ -z "$(_u_cron_files)" ]] || leftovers+=("cron jobs")
         ((${#leftovers[@]})) && die "uninstall incomplete, still present: ${leftovers[*]} — remove manually and report."
     fi
-    log_ok "verified: no Zagros containers, images, volumes, networks, units, cron jobs, dirs, cache or CLI remain"
+    log_ok "verified: no Zagros containers, images, volumes, networks, units, cron jobs, dirs, cache, CLI or host agent remain"
 }
 
 cmd_uninstall() {
@@ -997,6 +1069,12 @@ cmd_update() {
     done
     require_root; require_installed
     ensure_cmd jq jq
+    # When invoked through the release bootstrap, ZAGROS_CLI_SELF points at
+    # the freshly downloaded script. Install it before rendering compose so
+    # an alpha.8.1 host receives this release's healthcheck and host agent,
+    # not only the new panel image.
+    install_cli_file
+    install_host_agent_files
     ASSUME_YES=$yes
     [[ -n "$version" ]] || version="$(resolve_version "$channel")"
     # release tags are published as vX.Y.Z — accept the bare numeric form too
@@ -1887,10 +1965,12 @@ cmd_repair() {
     if ! jq -e '
         (.studio_deferred | length) == 0 and
         (.account_deferred | length) == 0 and
+        ((.routing_deferred // []) | length) == 0 and
         ([.cores[] | select(.enabled == true and .state != "running")] | length) == 0
     ' "$report" >/dev/null; then
         log_err "runtime reconciliation is incomplete:"
         jq '{studio_deferred, account_deferred,
+             routing_deferred: (.routing_deferred // []),
              failed_cores: [.cores[] | select(.enabled == true and .state != "running")]}' \
             "$report" >&2
         log_err "no data was deleted${backup_path:+; safety backup: $backup_path}"
@@ -1900,6 +1980,7 @@ cmd_repair() {
     jq -r '.cores[] | select(.enabled == true) |
         "  reconciled \(.id): \(.state) / \(.health)"' "$report"
     [[ -x "$ZAGROS_BIN/zagros" ]] || install_cli_file
+    install_host_agent_files
     rm -rf "$rollback_dir"
     log_ok "repair finished — configs, ownership, schema, accounts and listeners reconciled"
     cmd_health
@@ -2266,6 +2347,7 @@ Core management (capability-driven, no core has a special place):
 Admin:
   create-admin [--username U] [--password P] [--sudo]
   reset-admin  [--username U] [--password P]
+  install-host-agent      install Settings → Panel Network apply/rollback agent
 
 Configuration (.env is the single source of truth):
   config                  show the effective config (masked secrets) [default]
@@ -2279,8 +2361,9 @@ Configuration (.env is the single source of truth):
   shell                   exec into the panel container
   uninstall [--yes]       FULL uninstall — containers, images, volumes,
                           networks, /opt/zagros, /var/lib/zagros (databases,
-                          backups, certificates, logs), /etc/zagros and this CLI.
-                          Prints a removal summary and asks for confirmation.
+                          backups, certificates, logs), /etc/zagros, this CLI
+                          and the root-only host agent. Prints a removal summary
+                          and asks for confirmation.
 
 Everything runs against the REAL services — nothing is simulated.
 Docs: https://github.com/ZagrosGM/zagros-scripts
@@ -2318,6 +2401,7 @@ main() {
         config)           cmd_config "$@" ;;
         create-admin)     cmd_create_admin "$@" ;;
         reset-admin)      cmd_reset_admin "$@" ;;
+        install-host-agent) cmd_install_host_agent "$@" ;;
         list-cores)       cmd_list_cores "$@" ;;
         install-core)     cmd_install_core "$@" ;;
         uninstall-core)   cmd_uninstall_core "$@" ;;

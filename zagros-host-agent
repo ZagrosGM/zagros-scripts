@@ -1,0 +1,167 @@
+#!/usr/bin/env bash
+# Root-only host action executor for Settings → Panel Network.
+# The web container writes a validated, secret-free request to the mounted
+# data tree; this agent owns .env, Docker recreation, health verification and
+# rollback. The Docker socket is never exposed to the panel.
+set -euo pipefail
+
+ZAGROS_HOME="${ZAGROS_HOME:-/opt/zagros}"
+ZAGROS_DATA="${ZAGROS_DATA:-/var/lib/zagros}"
+ENV_FILE="${ENV_FILE:-$ZAGROS_HOME/.env}"
+COMPOSE_FILE="${COMPOSE_FILE:-$ZAGROS_HOME/docker-compose.yml}"
+ACTION_DIR="${ACTION_DIR:-$ZAGROS_DATA/host-actions}"
+REQUEST="$ACTION_DIR/panel-network.request.json"
+RESULT="$ACTION_DIR/panel-network.result.json"
+LOCK="$ACTION_DIR/.apply.lock"
+
+mkdir -p "$ACTION_DIR"
+chmod 700 "$ACTION_DIR"
+exec 9>"$LOCK"
+flock -n 9 || exit 0
+[[ -s "$REQUEST" ]] || exit 0
+[[ $EUID -eq 0 ]] || { echo "host agent must run as root" >&2; exit 1; }
+command -v jq >/dev/null
+command -v docker >/dev/null
+
+operation="$(jq -er '.operation_id | select(type=="string" and length>=16)' "$REQUEST")"
+version="$(jq -er '.version' "$REQUEST")"
+[[ "$version" == 1 ]] || exit 1
+requested="$(jq -er '.requested_at' "$REQUEST")"
+now="$(date +%s)"
+(( requested <= now + 60 && now - requested <= 600 )) || exit 1
+
+port="$(jq -er '.settings.port | select(type=="number" and .>=1 and .<=65535)' "$REQUEST")"
+bind="$(jq -er '.settings.bind_address | select(type=="string" and length>0)' "$REQUEST")"
+scheme="$(jq -er '.settings.scheme | select(.=="http" or .=="https")' "$REQUEST")"
+domain="$(jq -r '.settings.domain // ""' "$REQUEST")"
+cert_id="$(jq -r '.settings.tls_certificate_id // ""' "$REQUEST")"
+trusted="$(jq -r '(.settings.trusted_proxies // []) | join(",")' "$REQUEST")"
+hsts="$(jq -r '.settings.hsts // false' "$REQUEST")"
+redirect="$(jq -r '.settings.redirect_http_to_https // false' "$REQUEST")"
+
+# Reject shell/control characters even though values are never eval'd.
+for value in "$bind" "$scheme" "$domain" "$cert_id" "$trusted"; do
+  [[ "$value" != *$'\n'* && "$value" != *$'\r'* ]] || exit 1
+done
+python3 - "$bind" "$domain" <<'PY'
+import ipaddress,re,sys
+ipaddress.ip_address(sys.argv[1])
+d=sys.argv[2]
+if d and not re.fullmatch(r"(?:[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?\.)*[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?",d):
+    raise SystemExit(1)
+PY
+
+cert="" key=""
+if [[ "$scheme" == https ]]; then
+  [[ -n "$cert_id" ]] || { echo "HTTPS requires a selected certificate" >&2; exit 1; }
+  if [[ "$cert_id" == */* ]]; then
+    cert="$ZAGROS_DATA/$cert_id"
+    case "$cert" in "$ZAGROS_DATA"/certs/*/fullchain.pem) ;; *) exit 1;; esac
+  else
+    cert="$ZAGROS_DATA/certs/$cert_id/fullchain.pem"
+  fi
+  key="$(dirname "$cert")/key.pem"
+  [[ -r "$cert" && -r "$key" ]] || { echo "certificate pair not found" >&2; exit 1; }
+  openssl x509 -in "$cert" -noout -checkend 0 >/dev/null
+  cert_pub="$(openssl x509 -in "$cert" -pubkey -noout | openssl pkey -pubin -outform der | sha256sum | cut -d' ' -f1)"
+  key_pub="$(openssl pkey -in "$key" -pubout -outform der | sha256sum | cut -d' ' -f1)"
+  [[ "$cert_pub" == "$key_pub" ]] || { echo "certificate/key mismatch" >&2; exit 1; }
+fi
+
+backup="$ACTION_DIR/.env.before.$operation"
+cp -a "$ENV_FILE" "$backup"
+chmod 600 "$backup"
+
+set_env() {
+  local key="$1" value="$2"
+  python3 - "$ENV_FILE" "$key" "$value" <<'PY'
+from pathlib import Path
+import sys
+p=Path(sys.argv[1]);key=sys.argv[2];value=sys.argv[3]
+lines=p.read_text().splitlines();out=[];done=False
+for line in lines:
+    if line.startswith(key+'=') or line.startswith('# '+key+'=') or line.startswith('#'+key+'='):
+        if not done: out.append(f'{key}={value}');done=True
+    else: out.append(line)
+if not done: out.append(f'{key}={value}')
+tmp=p.with_suffix('.agent-part');tmp.write_text('\n'.join(out)+'\n');tmp.chmod(0o600);tmp.replace(p)
+PY
+}
+
+write_result() {
+  local status="$1" rolled="$2" message="$3" url="$4"
+  jq -n --arg operation_id "$operation" --arg status "$status" \
+    --argjson rolled_back "$rolled" --arg message "$message" --arg public_url "$url" \
+    '{operation_id:$operation_id,status:$status,rolled_back:$rolled_back,message:$message,public_url:$public_url,completed_at:(now|floor)}' \
+    > "$RESULT.part"
+  chmod 600 "$RESULT.part"; mv "$RESULT.part" "$RESULT"
+}
+
+public_host="${domain:-$bind}"
+if [[ -z "$domain" && ( "$public_host" == "0.0.0.0" || "$public_host" == "::" ) ]]; then
+  public_host="127.0.0.1"
+fi
+[[ "$public_host" == *:* ]] && public_host="[$public_host]"
+default_port=80; [[ "$scheme" == https ]] && default_port=443
+suffix=":$port"; [[ "$port" == "$default_port" ]] && suffix=""
+public_url="$scheme://$public_host$suffix"
+public_base=""; [[ -n "$domain" ]] && public_base="$public_url"
+
+apply_values() {
+  set_env DOMAIN "$domain"
+  set_env PANEL_BASE_URL "$public_base"
+  set_env APP_BASE_URL "$public_base"
+  set_env UVICORN_HOST "$bind"
+  set_env UVICORN_PORT "$port"
+  set_env TRUSTED_PROXIES "$trusted"
+  set_env ZAGROS_HSTS "$hsts"
+  set_env ZAGROS_REDIRECT_HTTP_TO_HTTPS "$redirect"
+  if [[ "$scheme" == https ]]; then
+    set_env TLS_MODE on
+    set_env UVICORN_SSL_CERTFILE "$cert"
+    set_env UVICORN_SSL_KEYFILE "$key"
+    set_env UVICORN_SSL_CA_TYPE private
+  else
+    set_env TLS_MODE off
+    set_env UVICORN_SSL_CERTFILE ""
+    set_env UVICORN_SSL_KEYFILE ""
+  fi
+}
+
+cd "$ZAGROS_HOME"
+apply_values
+if docker compose --env-file "$ENV_FILE" up -d --force-recreate zagros >/dev/null 2>&1; then
+  healthy=0
+  for _ in $(seq 1 90); do
+    state="$(docker inspect -f '{{if .State.Health}}{{.State.Health.Status}}{{else}}{{.State.Status}}{{end}}' zagros 2>/dev/null || true)"
+    [[ "$state" == healthy || "$state" == running ]] && { healthy=1; break; }
+    [[ "$state" == exited || "$state" == dead ]] && break
+    sleep 2
+  done
+  if (( healthy )); then
+    if [[ "$scheme" == https ]]; then
+      curl -kfsS --max-time 10 "https://127.0.0.1:$port/dashboard/" -o /dev/null && probe=1 || probe=0
+    else
+      curl -fsS --max-time 10 "http://127.0.0.1:$port/dashboard/" -o /dev/null && probe=1 || probe=0
+    fi
+    if (( probe )); then
+      write_result success false "panel network configuration applied and health-checked" "$public_url"
+      rm -f "$REQUEST" "$backup"
+      exit 0
+    fi
+  fi
+fi
+
+cp -a "$backup" "$ENV_FILE"
+chmod 600 "$ENV_FILE"
+docker compose --env-file "$ENV_FILE" up -d --force-recreate zagros >/dev/null 2>&1 || true
+rolled=0
+for _ in $(seq 1 90); do
+  state="$(docker inspect -f '{{if .State.Health}}{{.State.Health.Status}}{{else}}{{.State.Status}}{{end}}' zagros 2>/dev/null || true)"
+  [[ "$state" == healthy || "$state" == running ]] && { rolled=1; break; }
+  sleep 2
+done
+write_result failed true "apply failed; previous .env restored" "$public_url"
+rm -f "$REQUEST" "$backup"
+(( rolled )) || exit 1
+exit 2

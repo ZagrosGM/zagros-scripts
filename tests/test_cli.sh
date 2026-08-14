@@ -26,6 +26,7 @@ LOGD="$T/logs"; mkdir -p "$LOGD"
 export ZAGROS_HOME="$T/opt/zagros"
 export ZAGROS_DATA="$T/var/lib/zagros"
 export ZAGROS_BIN="$T/bin"
+export ZAGROS_LIBEXEC="$T/libexec"
 export FAKE_DOCKER_STATE="$T/faked-state"
 export ZAGROS_ETC="$T/etc/zagros"
 export SYSTEMD_DIR="$T/systemd"
@@ -73,7 +74,7 @@ run bash "$CLI" help;            expect_rc "help exits 0" 0
 expect_out "help lists commands" "Service lifecycle:"
 run bash "$CLI" definitely-not-a-command; expect_rc "unknown command exits 2" 2
 expect_out "unknown command message" "unknown command"
-run bash "$SH" not-a-command;     expect_rc "bootstrap rejects non install/uninstall" 1
+run bash "$SH" not-a-command;     expect_rc "bootstrap rejects unknown command" 1
 PATH="/usr/bin:/bin" run bash "$SH" install; expect_rc "bootstrap demands root" 1
 
 # ----------------------------------------------------------------------------- #
@@ -314,8 +315,14 @@ sed -i \
     -e 's|^XRAY_EXECUTABLE_PATH=.*|XRAY_EXECUTABLE_PATH=/usr/local/bin/xray|' \
     -e 's|^XRAY_ASSETS_PATH=.*|XRAY_ASSETS_PATH=/usr/local/share/xray|' \
     "$ZAGROS_HOME/.env"
-run bash "$CLI" update --version v9.9.9-test
-expect_rc "update rc0" 0
+# The release bootstrap must refresh an old installed CLI before update; this
+# is how alpha.8.1 hosts receive the new compose healthcheck + host agent.
+printf '#!/usr/bin/env bash\necho stale-cli\n' > "$ZAGROS_BIN/zagros"
+chmod 0755 "$ZAGROS_BIN/zagros"
+run bash "$SH" update --version v9.9.9-test
+expect_rc "bootstrap update rc0" 0
+grep -q 'ZAGROS_CLI_VERSION="1.0.0-alpha.8.2"' "$ZAGROS_BIN/zagros" \
+    && ok "bootstrap update refreshed installed CLI" || bad "bootstrap update refreshed installed CLI"
 expect_out "update summary" "update complete"
 grep -q '^ZAGROS_IMAGE_TAG=v9.9.9-test$' "$ZAGROS_HOME/.env" \
     && ok "env tag flipped" || bad "env tag flipped"
@@ -473,6 +480,18 @@ say "t16b full uninstall sweeps units/cron/cache + stray docker artifacts, spare
 reset_fake
 run bash "$CLI" install
 expect_rc "t16b install rc0" 0
+# Production installs a root-only Panel Network agent. In this intentionally
+# non-systemd sandbox the files may be installed for lifecycle verification,
+# but readiness must stay fail-closed (no watcher means no .agent-ready).
+run env ZAGROS_FORCE_HOST_AGENT=1 bash "$CLI" install-host-agent
+expect_rc "host agent file install rc0 without systemd" 0
+expect_file "$ZAGROS_LIBEXEC/zagros-host-agent" "host agent binary installed"
+[[ "$(stat -c %a "$ZAGROS_LIBEXEC/zagros-host-agent")" == "755" ]] \
+    && ok "host agent binary is 0755" || bad "host agent binary is 0755"
+expect_file "$SYSTEMD_DIR/zagros-host-agent.service" "host agent service unit installed"
+expect_file "$SYSTEMD_DIR/zagros-host-agent.path" "host agent path unit installed"
+expect_no_file "$ZAGROS_DATA/host-actions/.agent-ready" "inactive watcher has no readiness marker"
+expect_out "non-systemd apply is explicitly disabled" "Panel Network Apply stays disabled"
 python3 - <<'EOF'
 import json, os, pathlib
 sd = pathlib.Path(os.environ["FAKE_DOCKER_STATE"]); sd.mkdir(parents=True, exist_ok=True)
@@ -497,6 +516,7 @@ run bash "$CLI" uninstall --yes
 expect_rc "t16b full uninstall rc0" 0
 expect_out "extended verify line" "units, cron jobs"
 expect_no_file "$SYSTEMD_DIR/zagros-panel.service" "systemd unit removed"
+expect_no_file "$ZAGROS_LIBEXEC/zagros-host-agent" "host agent binary removed"
 expect_no_file "$CRON_D_DIR/zagros-backup" "cron file removed"
 expect_no_file "$HOME/.cache/zagros" "CLI cache removed"
 expect_no_file "$ZAGROS_DATA" "data dir removed"
