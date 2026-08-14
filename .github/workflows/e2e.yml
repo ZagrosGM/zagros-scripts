@@ -144,8 +144,10 @@ jobs:
         run: |
           set -e
           cd tests
-          npm init -y >/dev/null 2>&1 || true
-          npm i playwright@1.45.0 --no-audit --no-fund
+          # Keep the Playwright package and browser revision in lockstep.
+          # Installing a second ad-hoc version made `npx` download one
+          # Chromium revision while browser-smoke.mjs imported another.
+          npm ci --no-audit --no-fund
           npx playwright install --with-deps chromium
           # spec: the panel must survive AT LEAST 5 minutes — soak is 300 s
           PANEL_URL="http://127.0.0.1:8000/dashboard/" \
