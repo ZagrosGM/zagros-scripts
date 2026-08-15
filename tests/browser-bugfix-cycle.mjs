@@ -96,6 +96,8 @@ const softetherSchema = {
       transports: [{ id: "udp", label: "UDP 1701", securities: [{ id: "none", label: "None", fields: [] }] }] },
     { id: "sstp", label: "Microsoft SSTP compatibility", default_port: 443,
       transports: [{ id: "tcp", label: "HTTPS/TCP", securities: [{ id: "none", label: "None", fields: [] }] }] },
+    { id: "pptp", label: "PPTP", default_port: 1723, fixed_port: true,
+      availability: "unsupported", reason: "PptpGet/PptpEnable are not commands in this SoftEther runtime.", transports: [] },
   ],
 };
 let createdUserPayload = null;
@@ -106,17 +108,21 @@ let previewPayload = null;
 // driver → portal host-resolution path is covered by Python integration and
 // real-core gates; this route covers what a user actually sees after opening
 // the copied /sub/<token> URL in Chromium.
-await page.route("**/sub/token-1", (route) => route.fulfill({
+await page.route("**/sub/token-*", (route) => {
+  const token = new URL(route.request().url()).pathname.split("/").pop() || "token-1";
+  const number = token.split("-").pop() || "1";
+  return route.fulfill({
   status: 200,
   contentType: "text/html; charset=utf-8",
   body: `<!doctype html><html lang="en"><head><title>Zagros subscription</title></head><body>
-    <main><h1>Subscription — user-1</h1>
+    <main><h1>Subscription — user-${number}</h1>
       <section data-core="sing-box"><h2>sing-box · Hysteria2</h2>
         <code data-generated-link>hysteria2://secret@vpn.public.example:38473/?sni=vpn.public.example</code></section>
       <section data-core="wireguard"><h2>WireGuard</h2>
         <pre data-generated-link>[Interface]\nAddress = 10.88.0.2/32\n[Peer]\nEndpoint = vpn.public.example:51820</pre></section>
     </main></body></html>`,
-}));
+  });
+});
 
 await page.route("**/api/**", async (route) => {
   const request = route.request();
@@ -124,6 +130,13 @@ await page.route("**/api/**", async (route) => {
   const path = url.pathname.replace(/^\/api/, "");
   if (request.method() === "GET" && path === "/users") return json(route, { users, total: users.length });
   if (request.method() === "GET" && path === "/zagros/users/online") return json(route, { states, failed_cores: [] });
+  // Current contract: Users resolves the canonical public URL lazily from
+  // portal settings instead of trusting the legacy row's subscription_url.
+  if (request.method() === "GET" && path.startsWith("/zagros/users/by-username/") && path.endsWith("/subscription-url")) {
+    const username = decodeURIComponent(path.split("/")[4] || "");
+    const row = users.find((item) => item.username === username);
+    return json(route, { path: row?.subscription_url || "/sub/token-1", url: null, listener_mode: "shared" });
+  }
   if (request.method() === "GET" && path === "/user_template") return json(route, [{
     id: 1, name: "WireGuard template", data_limit: 5 * 1024 ** 3, expire_duration: 86400,
     username_prefix: "tpl-", username_suffix: "-z", inbounds: {}, core_access: { wireguard: ["wg-main"] },
@@ -190,8 +203,12 @@ for (const state of ["online", "offline", "unknown"]) {
   ok(`presence ${state}: DOM element always exists`, await page.locator(`[data-presence="${state}"]`).count() >= 1);
 }
 await page.getByRole("button", { name: /Copy subscription/i }).first().click();
-const copiedSubscription = await page.evaluate(() => navigator.clipboard.readText());
-ok("subscription copy uses canonical /sub/<token>", /\/sub\/token-1$/.test(copiedSubscription) && !copiedSubscription.includes("/zagros/sub/"), copiedSubscription);
+let copiedSubscription = "";
+for (let attempt = 0; attempt < 30 && !copiedSubscription; attempt++) {
+  await page.waitForTimeout(100);
+  copiedSubscription = await page.evaluate(() => navigator.clipboard.readText());
+}
+ok("subscription copy uses canonical /sub/<token>", /\/sub\/token-\d+$/.test(copiedSubscription) && !copiedSubscription.includes("/zagros/sub/"), copiedSubscription);
 await page.setViewportSize({ width: 390, height: 820 });
 await page.waitForTimeout(700);
 ok("users mobile: rows do not overlap (horizontal scroll instead)", await rowsDoNotOverlap());
@@ -243,6 +260,10 @@ ok("hosts: SERVER_IP default address present", hostValues.includes("{SERVER_IP}"
 const hostsCoreSelect = page.locator("main select").first();
 await hostsCoreSelect.selectOption("sing-box");
 await page.getByText("hy2-main", { exact: true }).waitFor();
+// The tag comes from the already-cached catalog; wait for the independent
+// core-host query as well so this measures rendered server state, not its
+// transient loading frame.
+await page.locator('main input[value="{SERVER_IP}"]').waitFor();
 const singBoxHostsBody = await page.locator("main").innerText();
 const singBoxHostValues = await page.locator("main input").evaluateAll((inputs) => inputs.map((input) => input.value));
 ok("hosts: sing-box Host Settings render the Hysteria2 inbound", /hy2-main/.test(singBoxHostsBody));
@@ -304,8 +325,11 @@ await rawTransport.waitFor();
 const rawTransportCount = await rawTransport.count();
 ok("SoftEther wizard: L2TP RAW transport is exposed",
   rawTransportCount >= 1, `count=${rawTransportCount}`);
-ok("SoftEther wizard: unsupported PPTP is absent",
-  await wizard.getByRole("button", { name: /PPTP/i }).count() === 0);
+const pptpButton = wizard.getByRole("button", { name: /PPTP/i });
+ok("SoftEther wizard: unsupported PPTP stays visible",
+  await pptpButton.count() === 1);
+ok("SoftEther wizard: unsupported PPTP cannot be selected",
+  await pptpButton.isDisabled());
 await wizard.getByRole("button", { name: /L2TP\/IPsec/i }).click();
 await wizard.getByRole("button", { name: /continue/i }).click();
 await wizard.getByRole("button", { name: /continue/i }).click();
@@ -332,7 +356,7 @@ await page.goto(copiedSubscription, { waitUntil: "domcontentloaded" });
 await page.locator("[data-generated-link]").first().waitFor();
 const portalText = await page.locator("main").innerText();
 const generatedLinks = await page.locator("[data-generated-link]").allInnerTexts();
-ok("subscription portal: canonical user page opens", /Subscription — user-1/.test(portalText));
+ok("subscription portal: canonical user page opens", /Subscription — user-\d+/.test(portalText));
 ok("subscription portal: sing-box and WireGuard artifacts are present",
   /sing-box/.test(portalText) && /WireGuard/.test(portalText));
 ok("subscription portal: generated user links never contain loopback",

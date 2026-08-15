@@ -66,6 +66,15 @@ if [[ "$scheme" == https ]]; then
   cert_pub="$(openssl x509 -in "$cert" -pubkey -noout | openssl pkey -pubin -outform der | sha256sum | cut -d' ' -f1)"
   key_pub="$(openssl pkey -in "$key" -pubout -outform der | sha256sum | cut -d' ' -f1)"
   [[ "$cert_pub" == "$key_pub" ]] || { echo "certificate/key mismatch" >&2; exit 1; }
+  # A successful restart with a certificate for another hostname is not a
+  # successful Apply: the browser would reject the new URL before redirect.
+  if [[ -n "$domain" ]]; then
+    openssl x509 -in "$cert" -noout -checkhost "$domain" >/dev/null \
+      || { echo "certificate does not cover panel domain" >&2; exit 1; }
+  elif [[ "$bind" != "0.0.0.0" && "$bind" != "::" ]]; then
+    openssl x509 -in "$cert" -noout -checkip "$bind" >/dev/null \
+      || { echo "certificate does not cover panel bind address" >&2; exit 1; }
+  fi
 fi
 
 backup="$ACTION_DIR/.env.before.$operation"
@@ -107,6 +116,30 @@ suffix=":$port"; [[ "$port" == "$default_port" ]] && suffix=""
 public_url="$scheme://$public_host$suffix"
 public_base=""; [[ -n "$domain" ]] && public_base="$public_url"
 
+# Authoritative host-side TOCTOU guard. The API performs the same ownership
+# preflight, but a listener can appear between submit and this root worker.
+# Never rewrite .env or restart Docker when the destination is already owned.
+if ! command -v ss >/dev/null; then
+  write_result failed false "cannot inspect TCP listener ownership (ss/iproute2 missing); no changes applied" "$public_url"
+  rm -f "$REQUEST" "$backup"
+  exit 2
+fi
+listener="$(ss -H -ltnp "sport = :$port" 2>/dev/null || true)"
+if [[ -n "$listener" ]]; then
+  # Re-applying the current panel socket is allowed only when the live owner is
+  # the panel Python process. Any vpnserver owner on 443 is SoftEther SSTP.
+  current_port="$(sed -nE "s/^[[:space:]]*UVICORN_PORT[[:space:]]*=[[:space:]]*['\"]?([0-9]+).*/\\1/p" "$ENV_FILE" | tail -1)"
+  if [[ "$port" != "${current_port:-}" || "$listener" != *'users:(("python"'* ]]; then
+    owner="host listener"
+    [[ "$listener" == *'vpnserver'* ]] && owner="SoftEther VPN Server"
+    [[ "$port" == 443 && "$listener" == *'vpnserver'* ]] && owner="SoftEther SSTP"
+    message="Port $port is already owned by $owner. Choose another panel port or explicitly move the conflicting listener. No changes applied."
+    write_result failed false "$message" "$public_url"
+    rm -f "$REQUEST" "$backup"
+    exit 2
+  fi
+fi
+
 apply_values() {
   set_env DOMAIN "$domain"
   set_env PANEL_BASE_URL "$public_base"
@@ -140,7 +173,18 @@ if docker compose --env-file "$ENV_FILE" up -d --force-recreate zagros >/dev/nul
   done
   if (( healthy )); then
     if [[ "$scheme" == https ]]; then
-      curl -kfsS --max-time 10 "https://127.0.0.1:$port/dashboard/" -o /dev/null && probe=1 || probe=0
+      # Verify certificate chain/signature AND hostname. --cacert supports a
+      # panel-managed private/self-signed certificate without disabling TLS
+      # verification; public chains work as well.
+      probe_name="${domain:-$bind}"
+      if [[ "$probe_name" == "0.0.0.0" || "$probe_name" == "::" ]]; then
+        probe=0  # no hostname/IP exists that a browser could verify
+      else
+        curl -fsS --max-time 10 --cacert "$cert" \
+          --resolve "$probe_name:$port:127.0.0.1" \
+          "https://$probe_name:$port/dashboard/" -o /dev/null \
+          && probe=1 || probe=0
+      fi
     else
       curl -fsS --max-time 10 "http://127.0.0.1:$port/dashboard/" -o /dev/null && probe=1 || probe=0
     fi
