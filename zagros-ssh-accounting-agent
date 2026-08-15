@@ -1,0 +1,187 @@
+#!/usr/bin/env python3
+"""Read-only host collector for bidirectional SSH transport accounting.
+
+The Panel container intentionally has no host PID namespace or Docker socket.
+This fixed-purpose root service reads only:
+  * a mode-0600 JSON list of Panel-owned SSH listener ports;
+  * host ``ss -tinpe`` socket counters and /proc PID UIDs;
+and atomically writes cumulative per-UID counters under /var/lib/zagros.
+It accepts no commands, paths, credentials, shell snippets, or network input.
+"""
+from __future__ import annotations
+
+import json
+import os
+import re
+import signal
+import subprocess
+import time
+from pathlib import Path
+
+ROOT = Path(os.environ.get("ZAGROS_SSH_ACCOUNTING_DIR", "/var/lib/zagros/cores/ssh"))
+PORTS = ROOT / "accounting-listeners.json"
+STATE = ROOT / "host-transport-usage.json"
+FORGET = ROOT / "accounting-forget.json"
+INTERVAL = min(10.0, max(0.25, float(os.environ.get("ZAGROS_SSH_ACCOUNTING_INTERVAL", "1"))))
+STOP = False
+
+
+def stop(_signum, _frame):
+    global STOP
+    STOP = True
+
+
+def load_state():
+    try:
+        raw = json.loads(STATE.read_text())
+        totals = {int(k): (int(v[0]), int(v[1])) for k, v in (raw.get("totals") or {}).items()}
+        live = {str(k): (int(v[0]), int(v[1]), int(v[2])) for k, v in (raw.get("live") or {}).items()}
+        forgotten = {int(v) for v in (raw.get("forgotten") or [])
+                     if 0 < int(v) <= 0x00FFFFFF}
+        return totals, live, forgotten
+    except (OSError, ValueError, TypeError):
+        return {}, {}, set()
+
+
+def ports():
+    try:
+        values = json.loads(PORTS.read_text())
+        if not isinstance(values, list) or len(values) > 64:
+            return []
+        return sorted({int(v) for v in values if 1 <= int(v) <= 65535})
+    except (OSError, ValueError, TypeError):
+        return []
+
+
+def pid_uid(pid):
+    try:
+        rows = Path(f"/proc/{pid}/status").read_text().splitlines()
+        line = next(row for row in rows if row.startswith("Uid:"))
+        non_root = [int(v) for v in line.split()[1:] if int(v) > 0]
+        return non_root[0] if non_root else None
+    except (OSError, StopIteration, ValueError):
+        return None
+
+
+def snapshot():
+    result = {}
+    for port in ports():
+        proc = subprocess.run(
+            ["/usr/bin/ss", "-Htinpe", f"sport = :{port}"],
+            capture_output=True, text=True, timeout=15, check=False,
+        )
+        if proc.returncode not in (0, 1):
+            continue
+        block = None
+        blocks = []
+        for line in proc.stdout.splitlines():
+            if line and not line[0].isspace():
+                if block:
+                    blocks.append(block)
+                block = line
+            elif block is not None:
+                block += " " + line.strip()
+        if block:
+            blocks.append(block)
+        for block in blocks:
+            pids = sorted({int(v) for v in re.findall(r"\bpid=(\d+)", block)})
+            uids = [uid for uid in (pid_uid(pid) for pid in pids) if uid is not None]
+            sent = re.search(r"\bbytes_sent:(\d+)", block)
+            received = re.search(r"\bbytes_received:(\d+)", block)
+            inode = re.search(r"\bino:(\d+)", block)
+            if not uids or sent is None or received is None or inode is None:
+                continue
+            # inode is stable for the socket lifetime and avoids PID-reuse ambiguity.
+            key = f"{port}:{inode.group(1)}"
+            result[key] = (min(uids), int(received.group(1)), int(sent.group(1)))
+    return result
+
+
+def apply_forget(totals, live, forgotten):
+    """Consume deletion requests without allowing a lingering socket replay.
+
+    OpenSSH teardown is asynchronous: the account can be deleted while its
+    accepted transport socket remains visible to ``ss`` for another sample.
+    A one-shot forget would then rediscover that socket and import its entire
+    lifetime again. Keep a bounded UID tombstone only while an old live socket
+    still exists; it is cleared as soon as one snapshot has no such socket, so
+    normal OS UID reuse is not suppressed.
+    """
+    try:
+        values = json.loads(FORGET.read_text())
+        if not isinstance(values, list) or len(values) > 1024:
+            return totals, live, forgotten
+        forgotten.update(int(v) for v in values if 0 < int(v) <= 0x00FFFFFF)
+    except (OSError, ValueError, TypeError):
+        return totals, live, forgotten
+    totals = {uid: value for uid, value in totals.items() if uid not in forgotten}
+    live = {key: value for key, value in live.items() if value[0] not in forgotten}
+    try:
+        FORGET.unlink()
+    except OSError:
+        pass
+    return totals, live, forgotten
+
+
+def save(totals, live, forgotten):
+    ROOT.mkdir(parents=True, exist_ok=True, mode=0o700)
+    os.chmod(ROOT, 0o700)
+    part = STATE.with_suffix(".part")
+    part.write_text(json.dumps({
+        "version": 1,
+        "updated_at": int(time.time()),
+        "totals": {str(uid): [up, down] for uid, (up, down) in totals.items()},
+        "live": {key: [uid, received, sent] for key, (uid, received, sent) in live.items()},
+        "forgotten": sorted(forgotten),
+    }, separators=(",", ":")))
+    os.chmod(part, 0o600)
+    part.replace(STATE)
+
+
+def collect(totals, live, forgotten):
+    observed = snapshot()
+    # Persist each tombstone only while a pre-deletion transport socket still
+    # exists. Filter before delta calculation so it can never be re-imported.
+    forgotten.intersection_update(uid for uid, _received, _sent in observed.values())
+    current = {key: value for key, value in observed.items()
+               if value[0] not in forgotten}
+    for key, (uid, received, sent) in current.items():
+        previous = live.get(key)
+        if previous is not None and previous[0] == uid:
+            up_delta = received - previous[1] if received >= previous[1] else received
+            down_delta = sent - previous[2] if sent >= previous[2] else sent
+        else:
+            up_delta, down_delta = received, sent
+        up, down = totals.get(uid, (0, 0))
+        totals[uid] = (up + max(0, up_delta), down + max(0, down_delta))
+    save(totals, current, forgotten)
+    return current
+
+
+def main():
+    if os.geteuid() != 0:
+        raise SystemExit("zagros SSH accounting agent must run as root")
+    if not os.path.isfile("/usr/bin/ss"):
+        raise SystemExit("/usr/bin/ss is required")
+    signal.signal(signal.SIGTERM, stop)
+    signal.signal(signal.SIGINT, stop)
+    totals, live, forgotten = load_state()
+    while not STOP:
+        try:
+            totals, live, forgotten = apply_forget(totals, live, forgotten)
+            live = collect(totals, live, forgotten)
+        except Exception:
+            # Never leak command output, process titles, endpoints, or credentials.
+            pass
+        end = time.monotonic() + INTERVAL
+        while not STOP and time.monotonic() < end:
+            time.sleep(min(0.2, end - time.monotonic()))
+    try:
+        totals, live, forgotten = apply_forget(totals, live, forgotten)
+        collect(totals, live, forgotten)
+    except Exception:
+        pass
+
+
+if __name__ == "__main__":
+    main()

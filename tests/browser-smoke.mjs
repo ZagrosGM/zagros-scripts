@@ -30,13 +30,16 @@ const SOAK_SECS = Number(process.env.SOAK_SECS || 90);
 
 const PAGES = [
   "/users", "/admins", "/templates", "/subscriptions", "/nodes", "/cores",
-  "/routing", "/outbounds", "/inbounds", "/dns", "/certificates", "/sessions",
+  "/capabilities", "/routing", "/outbounds", "/inbounds", "/hosts", "/dns", "/certificates", "/sessions",
   "/devices", "/logs", "/marketplace", "/settings", "/advanced", "/",
 ];
 
 const events = { pageerrors: [], consoleErrors: [], failedReqs: [] };
 const browser = await chromium.launch();
-const ctx = await browser.newContext({ viewport: { width: 1400, height: 900 } });
+const ctx = await browser.newContext({
+  viewport: { width: 1400, height: 900 },
+  ignoreHTTPSErrors: process.env.IGNORE_HTTPS_ERRORS === "1",
+});
 const page = await ctx.newPage();
 page.on("pageerror", (err) => events.pageerrors.push(String(err)));
 page.on("console", (msg) => {

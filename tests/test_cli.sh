@@ -321,7 +321,7 @@ printf '#!/usr/bin/env bash\necho stale-cli\n' > "$ZAGROS_BIN/zagros"
 chmod 0755 "$ZAGROS_BIN/zagros"
 run bash "$SH" update --version v9.9.9-test
 expect_rc "bootstrap update rc0" 0
-grep -q 'ZAGROS_CLI_VERSION="1.0.0-alpha.8.2"' "$ZAGROS_BIN/zagros" \
+grep -q 'ZAGROS_CLI_VERSION="1.0.0-alpha.8.3"' "$ZAGROS_BIN/zagros" \
     && ok "bootstrap update refreshed installed CLI" || bad "bootstrap update refreshed installed CLI"
 expect_out "update summary" "update complete"
 grep -q '^ZAGROS_IMAGE_TAG=v9.9.9-test$' "$ZAGROS_HOME/.env" \
@@ -486,10 +486,14 @@ expect_rc "t16b install rc0" 0
 run env ZAGROS_FORCE_HOST_AGENT=1 bash "$CLI" install-host-agent
 expect_rc "host agent file install rc0 without systemd" 0
 expect_file "$ZAGROS_LIBEXEC/zagros-host-agent" "host agent binary installed"
+expect_file "$ZAGROS_LIBEXEC/zagros-ssh-accounting-agent" "SSH accounting agent installed"
 [[ "$(stat -c %a "$ZAGROS_LIBEXEC/zagros-host-agent")" == "755" ]] \
     && ok "host agent binary is 0755" || bad "host agent binary is 0755"
+[[ "$(stat -c %a "$ZAGROS_LIBEXEC/zagros-ssh-accounting-agent")" == "755" ]] \
+    && ok "SSH accounting agent is 0755" || bad "SSH accounting agent is 0755"
 expect_file "$SYSTEMD_DIR/zagros-host-agent.service" "host agent service unit installed"
 expect_file "$SYSTEMD_DIR/zagros-host-agent.path" "host agent path unit installed"
+expect_file "$SYSTEMD_DIR/zagros-ssh-accounting.service" "SSH accounting service unit installed"
 expect_no_file "$ZAGROS_DATA/host-actions/.agent-ready" "inactive watcher has no readiness marker"
 expect_out "non-systemd apply is explicitly disabled" "Panel Network Apply stays disabled"
 python3 - <<'EOF'
@@ -517,6 +521,7 @@ expect_rc "t16b full uninstall rc0" 0
 expect_out "extended verify line" "units, cron jobs"
 expect_no_file "$SYSTEMD_DIR/zagros-panel.service" "systemd unit removed"
 expect_no_file "$ZAGROS_LIBEXEC/zagros-host-agent" "host agent binary removed"
+expect_no_file "$ZAGROS_LIBEXEC/zagros-ssh-accounting-agent" "SSH accounting agent removed"
 expect_no_file "$CRON_D_DIR/zagros-backup" "cron file removed"
 expect_no_file "$HOME/.cache/zagros" "CLI cache removed"
 expect_no_file "$ZAGROS_DATA" "data dir removed"

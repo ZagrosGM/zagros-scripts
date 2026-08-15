@@ -5,10 +5,15 @@ const panel = (process.env.PANEL_URL || "").replace(/\/+$/, "/");
 const user = process.env.PANEL_USER || "";
 const pass = process.env.PANEL_PASS || "";
 const target = process.env.ROUTING_TARGET || "wireguard-31434";
+const source = process.env.ROUTING_SOURCE || "wireguard-59129";
+const ignoreHTTPSErrors = process.env.IGNORE_HTTPS_ERRORS === "1";
 if (!panel || !user || !pass) throw new Error("PANEL_URL/PANEL_USER/PANEL_PASS required");
 
 const browser = await chromium.launch({ headless: true });
-const page = await browser.newPage({ viewport: { width: 1500, height: 1050 } });
+const page = await browser.newPage({
+  viewport: { width: 1500, height: 1050 },
+  ignoreHTTPSErrors,
+});
 const errors = [];
 page.on("pageerror", (error) => errors.push(String(error)));
 page.on("console", (message) => { if (message.type() === "error") errors.push(message.text()); });
@@ -51,10 +56,10 @@ try {
 
   // Create → deploy → edit → disable/enable → reload. The real backend owns it.
   await page.goto(panel + "#/routing", { waitUntil: "networkidle" });
-  await page.getByRole("button", { name: /rule/i }).last().click();
+  await page.getByRole("button", { name: /^rule$/i }).click();
   dialog = page.getByRole("dialog");
   await dialog.locator('input[placeholder="iran-via-warp"]').fill("browser-matrix-rule");
-  await dialog.locator('input[placeholder="reality-in"]').fill("wireguard-59129");
+  await dialog.locator('input[placeholder="reality-in"]').fill(source);
   await dialog.locator('input[placeholder="reality-in"]').press("Enter");
   await dialog.locator("label").filter({ hasText: /^action/ }).locator("select").selectOption("route_to");
   await dialog.locator("label").filter({ hasText: /target outbound/ }).locator("select").selectOption(target);

@@ -25,7 +25,7 @@
 # =============================================================================
 set -euo pipefail
 
-ZAGROS_CLI_VERSION="1.0.0-alpha.8.2"
+ZAGROS_CLI_VERSION="1.0.0-alpha.8.3"
 SCRIPTS_REPO_RAW="https://raw.githubusercontent.com/ZagrosGM/zagros-scripts"
 PANEL_REPO="ZagrosGM/Zagros"
 PANEL_API="https://api.github.com/repos/${PANEL_REPO}"
@@ -576,7 +576,9 @@ install_host_agent_files() {
         return 0
     fi
     local target="$ZAGROS_LIBEXEC/zagros-host-agent" source=""
-    mkdir -p "$ZAGROS_LIBEXEC" "$SYSTEMD_DIR" "$ZAGROS_DATA/host-actions"
+    local acct_target="$ZAGROS_LIBEXEC/zagros-ssh-accounting-agent" acct_source=""
+    mkdir -p "$ZAGROS_LIBEXEC" "$SYSTEMD_DIR" "$ZAGROS_DATA/host-actions" \
+        "$ZAGROS_DATA/cores/ssh"
     chmod 700 "$ZAGROS_DATA/host-actions"
     if [[ -r "$(dirname "${BASH_SOURCE[0]}")/zagros-host-agent" ]]; then
         source="$(dirname "${BASH_SOURCE[0]}")/zagros-host-agent"
@@ -584,6 +586,13 @@ install_host_agent_files() {
     else
         curl -fsSL "$SCRIPTS_REPO_RAW/$ZAGROS_SCRIPTS_REF/zagros-host-agent" -o "$target"
         chmod 0755 "$target"
+    fi
+    if [[ -r "$(dirname "${BASH_SOURCE[0]}")/zagros-ssh-accounting-agent" ]]; then
+        acct_source="$(dirname "${BASH_SOURCE[0]}")/zagros-ssh-accounting-agent"
+        install -m 0755 "$acct_source" "$acct_target"
+    else
+        curl -fsSL "$SCRIPTS_REPO_RAW/$ZAGROS_SCRIPTS_REF/zagros-ssh-accounting-agent" -o "$acct_target"
+        chmod 0755 "$acct_target"
     fi
     cat > "$SYSTEMD_DIR/zagros-host-agent.service" <<EOF
 [Unit]
@@ -606,8 +615,34 @@ Unit=zagros-host-agent.service
 [Install]
 WantedBy=multi-user.target
 EOF
+    cat > "$SYSTEMD_DIR/zagros-ssh-accounting.service" <<EOF
+[Unit]
+Description=Zagros read-only SSH transport accounting collector
+After=docker.service
+Requires=docker.service
+
+[Service]
+Type=simple
+ExecStart=$acct_target
+Restart=always
+RestartSec=2
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=yes
+ReadWritePaths=$ZAGROS_DATA/cores/ssh
+CapabilityBoundingSet=CAP_DAC_READ_SEARCH CAP_SYS_PTRACE
+AmbientCapabilities=CAP_DAC_READ_SEARCH CAP_SYS_PTRACE
+RestrictAddressFamilies=AF_NETLINK AF_UNIX
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+
+[Install]
+WantedBy=multi-user.target
+EOF
     chmod 0644 "$SYSTEMD_DIR/zagros-host-agent.service" \
-        "$SYSTEMD_DIR/zagros-host-agent.path"
+        "$SYSTEMD_DIR/zagros-host-agent.path" \
+        "$SYSTEMD_DIR/zagros-ssh-accounting.service"
     # Readiness is a runtime fact, not merely "files were copied". A stale
     # marker on a non-systemd host would let the panel queue an operation that
     # nobody can consume, leaving Apply pending forever.
@@ -616,11 +651,13 @@ EOF
             && command -v systemctl >/dev/null 2>&1 \
             && [[ -d /run/systemd/system ]] \
             && systemctl daemon-reload \
-            && systemctl enable --now zagros-host-agent.path >/dev/null \
-            && systemctl is-active --quiet zagros-host-agent.path; then
+            && systemctl enable --now zagros-host-agent.path \
+                zagros-ssh-accounting.service >/dev/null \
+            && systemctl is-active --quiet zagros-host-agent.path \
+            && systemctl is-active --quiet zagros-ssh-accounting.service; then
         touch "$ZAGROS_DATA/host-actions/.agent-ready"
         chmod 0600 "$ZAGROS_DATA/host-actions/.agent-ready"
-        log_ok "host network agent active (atomic Panel Network apply + rollback)"
+        log_ok "host agents active (network apply/rollback + read-only SSH accounting)"
     else
         log_warn "host network agent files installed but path watcher is inactive; Panel Network Apply stays disabled until systemd activation succeeds"
     fi
@@ -962,7 +999,8 @@ uninstall_filesystem_sweep() {
                             # certificates, TLS keys, runtime data, logs, backups, cache
     rm -rf "$ZAGROS_ETC"     # legacy/config leftovers where present
     rm -f  "$ZAGROS_BIN/zagros"
-    rm -f  "$ZAGROS_LIBEXEC/zagros-host-agent"
+    rm -f  "$ZAGROS_LIBEXEC/zagros-host-agent" \
+        "$ZAGROS_LIBEXEC/zagros-ssh-accounting-agent"
     rm -rf "$HOME/.cache/zagros"   # CLI cache (only the exact known dir — never globs)
     log_ok "removed $ZAGROS_HOME, $ZAGROS_DATA, $ZAGROS_ETC, units, cron jobs, cache, CLI and host agent"
 }
@@ -988,6 +1026,7 @@ uninstall_verify() {
     [[ -e "$ZAGROS_ETC" ]] && leftovers+=("$ZAGROS_ETC")
     [[ -e "$ZAGROS_BIN/zagros" ]] && leftovers+=("$ZAGROS_BIN/zagros")
     [[ -e "$ZAGROS_LIBEXEC/zagros-host-agent" ]] && leftovers+=("$ZAGROS_LIBEXEC/zagros-host-agent")
+    [[ -e "$ZAGROS_LIBEXEC/zagros-ssh-accounting-agent" ]] && leftovers+=("$ZAGROS_LIBEXEC/zagros-ssh-accounting-agent")
     [[ -e "$HOME/.cache/zagros" ]] && leftovers+=("$HOME/.cache/zagros")
 
     if ((${#leftovers[@]})); then
@@ -1017,7 +1056,8 @@ uninstall_verify() {
             systemctl daemon-reload >/dev/null 2>&1 || true
         fi
         rm -rf "$ZAGROS_HOME" "$ZAGROS_DATA" "$ZAGROS_ETC" "$HOME/.cache/zagros"
-        rm -f "$ZAGROS_BIN/zagros" "$ZAGROS_LIBEXEC/zagros-host-agent"
+        rm -f "$ZAGROS_BIN/zagros" "$ZAGROS_LIBEXEC/zagros-host-agent" \
+            "$ZAGROS_LIBEXEC/zagros-ssh-accounting-agent"
         # final re-check — honesty: fail loudly instead of claiming success
         leftovers=()
         [[ -e "$ZAGROS_HOME" ]] && leftovers+=("$ZAGROS_HOME")
@@ -1025,6 +1065,7 @@ uninstall_verify() {
         [[ -e "$ZAGROS_ETC" ]] && leftovers+=("$ZAGROS_ETC")
         [[ -e "$ZAGROS_BIN/zagros" ]] && leftovers+=("$ZAGROS_BIN/zagros")
         [[ -e "$ZAGROS_LIBEXEC/zagros-host-agent" ]] && leftovers+=("$ZAGROS_LIBEXEC/zagros-host-agent")
+        [[ -e "$ZAGROS_LIBEXEC/zagros-ssh-accounting-agent" ]] && leftovers+=("$ZAGROS_LIBEXEC/zagros-ssh-accounting-agent")
         [[ -e "$HOME/.cache/zagros" ]] && leftovers+=("$HOME/.cache/zagros")
         [[ $(docker ps -a --format '{{.Names}}' 2>/dev/null | grep -c '^zagros' || true) == "0" ]] \
             || leftovers+=("docker containers")
