@@ -25,7 +25,7 @@
 # =============================================================================
 set -euo pipefail
 
-ZAGROS_CLI_VERSION="1.0.0-alpha.8.3"
+ZAGROS_CLI_VERSION="1.0.0-alpha.8.4"
 SCRIPTS_REPO_RAW="https://raw.githubusercontent.com/ZagrosGM/zagros-scripts"
 PANEL_REPO="ZagrosGM/Zagros"
 PANEL_API="https://api.github.com/repos/${PANEL_REPO}"
@@ -567,6 +567,28 @@ install_cli_file() {  # install_cli_file — place the running CLI into $ZAGROS_
     log_ok "CLI installed → $target"
 }
 
+wait_ssh_accounting_snapshot() {
+    # A running systemd unit is not enough: the Panel consumes this heartbeat.
+    # Bound the wait so install-host-agent reports the real failure instead of
+    # printing success while Core Settings stays degraded indefinitely.
+    local state="$ZAGROS_DATA/cores/ssh/host-transport-usage.json"
+    local i
+    for i in $(seq 1 40); do
+        if python3 - "$state" <<'PYEOF' 2>/dev/null
+import json, os, sys, time
+path = sys.argv[1]
+raw = json.load(open(path, encoding="utf-8"))
+assert raw.get("version") == 1 and isinstance(raw.get("totals"), dict)
+assert time.time() - os.path.getmtime(path) <= 5
+PYEOF
+        then
+            return 0
+        fi
+        sleep 0.25
+    done
+    return 1
+}
+
 install_host_agent_files() {
     # The CLI harness relocates SYSTEMD_DIR into a sandbox. Do not contact the
     # network or the real systemd daemon there; production uses the canonical
@@ -654,12 +676,19 @@ EOF
             && systemctl enable --now zagros-host-agent.path \
                 zagros-ssh-accounting.service >/dev/null \
             && systemctl is-active --quiet zagros-host-agent.path \
-            && systemctl is-active --quiet zagros-ssh-accounting.service; then
+            && systemctl is-active --quiet zagros-ssh-accounting.service \
+            && wait_ssh_accounting_snapshot; then
         touch "$ZAGROS_DATA/host-actions/.agent-ready"
         chmod 0600 "$ZAGROS_DATA/host-actions/.agent-ready"
-        log_ok "host agents active (network apply/rollback + read-only SSH accounting)"
+        log_ok "host agents active; SSH accounting heartbeat is fresh"
     else
-        log_warn "host network agent files installed but path watcher is inactive; Panel Network Apply stays disabled until systemd activation succeeds"
+        if [[ "$SYSTEMD_DIR" != "/etc/systemd/system" ]]; then
+            log_warn "host network agent files installed but path watcher is inactive; Panel Network Apply stays disabled until systemd activation succeeds"
+            return 0
+        fi
+        log_err "host-agent verification failed: path watcher, SSH collector, or fresh accounting heartbeat is unavailable"
+        log_warn "Panel Network Apply remains disabled and SSH Core Settings will name the missing/stale snapshot until this is fixed"
+        return 1
     fi
 }
 
