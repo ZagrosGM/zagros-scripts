@@ -113,7 +113,7 @@ await page.route("**/api/**", async (route) => {
       available: ["xray", "sing-box", "openvpn", "wireguard", "ssh", "softether"] },
   }] });
   if (path === "/zagros/panel/info") return fulfill(route, {
-    version: "1.0.0-alpha.8.3", app_name: "Zagros", domain: "old.example.test",
+    version: "1.0.0-alpha.8.4", app_name: "Zagros", domain: "old.example.test",
     panel_base_url: base, app_base_url: base, client_auth_mode: "subscription",
     subscription_path: "clients", tls_mode: "off", uptime_seconds: 10,
     database_driver: "sqlite",
