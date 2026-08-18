@@ -5,7 +5,7 @@ set -euo pipefail
 
 NODE_HOME="${ZAGROS_NODE_HOME:-/opt/zagros-node}"
 NODE_DATA="${ZAGROS_NODE_DATA:-/var/lib/zagros-node}"
-IMAGE="${ZAGROS_NODE_IMAGE:-ghcr.io/zagrosgm/zagros:v1.0.0-alpha.8.5}"
+IMAGE="${ZAGROS_NODE_IMAGE:-ghcr.io/zagrosgm/zagros:v1.0.0-alpha.8.6}"
 PORT="${ZAGROS_NODE_PORT:-62050}"
 
 need_root() { [[ $EUID -eq 0 ]] || { echo "zagros-node requires root" >&2; exit 1; }; }
