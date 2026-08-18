@@ -49,6 +49,24 @@ def test_agent_has_fixed_scope_and_no_shell_execution_surface() -> None:
     assert "password" not in text.lower()
 
 
+def test_host_agent_install_restarts_existing_units_before_heartbeat_probe() -> None:
+    """`enable --now` cannot refresh an already-active mount namespace.
+
+    If the SSH core directory was removed and recreated, the collector's
+    systemd ReadWritePaths bind can still reference the deleted inode. The
+    installer must restart the collector (and updated path unit) before it
+    accepts a fresh heartbeat or writes the Panel readiness marker.
+    """
+    cli = (ROOT / "zagros").read_text()
+    restart_collector = "systemctl restart zagros-ssh-accounting.service"
+    restart_watcher = "systemctl restart zagros-host-agent.path"
+    heartbeat = "&& wait_ssh_accounting_snapshot; then"
+    assert restart_collector in cli
+    assert restart_watcher in cli
+    assert cli.index(restart_collector) < cli.index(heartbeat)
+    assert cli.index(restart_watcher) < cli.index(heartbeat)
+
+
 def test_forget_tombstone_blocks_lingering_socket_then_allows_uid_reuse(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
