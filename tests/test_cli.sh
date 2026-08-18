@@ -321,7 +321,7 @@ printf '#!/usr/bin/env bash\necho stale-cli\n' > "$ZAGROS_BIN/zagros"
 chmod 0755 "$ZAGROS_BIN/zagros"
 run bash "$SH" update --version v9.9.9-test
 expect_rc "bootstrap update rc0" 0
-grep -q 'ZAGROS_CLI_VERSION="1.0.0-alpha.8.6"' "$ZAGROS_BIN/zagros" \
+grep -q 'ZAGROS_CLI_VERSION="1.0.0-alpha.8.6.1"' "$ZAGROS_BIN/zagros" \
     && ok "bootstrap update refreshed installed CLI" || bad "bootstrap update refreshed installed CLI"
 expect_out "update summary" "update complete"
 grep -q '^ZAGROS_IMAGE_TAG=v9.9.9-test$' "$ZAGROS_HOME/.env" \

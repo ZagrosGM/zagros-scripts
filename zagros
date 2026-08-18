@@ -25,7 +25,7 @@
 # =============================================================================
 set -euo pipefail
 
-ZAGROS_CLI_VERSION="1.0.0-alpha.8.6"
+ZAGROS_CLI_VERSION="1.0.0-alpha.8.6.1"
 SCRIPTS_REPO_RAW="https://raw.githubusercontent.com/ZagrosGM/zagros-scripts"
 PANEL_REPO="ZagrosGM/Zagros"
 PANEL_API="https://api.github.com/repos/${PANEL_REPO}"
@@ -669,12 +669,19 @@ EOF
     # marker on a non-systemd host would let the panel queue an operation that
     # nobody can consume, leaving Apply pending forever.
     rm -f "$ZAGROS_DATA/host-actions/.agent-ready"
+    # `enable --now` is a no-op for an already-active service. That is unsafe
+    # after update/uninstall recreated cores/ssh: systemd's ReadWritePaths bind
+    # still points at the deleted directory inode, so the old collector writes
+    # an invisible heartbeat. Restart both units to load the new binaries/units
+    # and enter a fresh mount namespace rooted at the persistent directories.
     if [[ "$SYSTEMD_DIR" == "/etc/systemd/system" ]] \
             && command -v systemctl >/dev/null 2>&1 \
             && [[ -d /run/systemd/system ]] \
             && systemctl daemon-reload \
             && systemctl enable --now zagros-host-agent.path \
                 zagros-ssh-accounting.service >/dev/null \
+            && systemctl restart zagros-ssh-accounting.service \
+            && systemctl restart zagros-host-agent.path \
             && systemctl is-active --quiet zagros-host-agent.path \
             && systemctl is-active --quiet zagros-ssh-accounting.service \
             && wait_ssh_accounting_snapshot; then

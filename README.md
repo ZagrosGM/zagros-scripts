@@ -18,10 +18,11 @@ and messages — nothing is simulated; and the stack is **core-agnostic**: no
 core binary is baked into the image, every core self-installs its official
 upstream release at runtime, and no core has a special place anywhere.
 
-> **Status: ALPHA** (`v1.0.0-alpha.8.6`). Suitable for evaluation and lab
-> testing. The CLI's semantics are covered by an end-to-end test suite
-> (`tests/`, 263 assertions) and the in-container bridge by the panel's
-> pytest suite — read *Verification* below honestly before production use.
+> **Status: ALPHA** (`v1.0.0-alpha.8.6.1` host-scripts hotfix for the
+> `v1.0.0-alpha.8.6` Panel). Suitable for evaluation and lab testing. The
+> CLI's semantics are covered by an end-to-end test suite (`tests/`, 267
+> assertions) and the in-container bridge by the panel's pytest suite — read
+> *Verification* below honestly before production use.
 
 ---
 
@@ -50,13 +51,16 @@ sudo zagros install-core xray         # self-install an official core binary
 ### Safe update (refresh host scripts before the image)
 
 ```bash
-sudo bash -c "$(curl -fsSL https://raw.githubusercontent.com/ZagrosGM/zagros-scripts/main/zagros.sh)" -- update --version v1.0.0-alpha.8.6
+sudo env ZAGROS_SCRIPTS_REF=v1.0.0-alpha.8.6.1 bash -c "$(curl -fsSL https://raw.githubusercontent.com/ZagrosGM/zagros-scripts/v1.0.0-alpha.8.6.1/zagros.sh)" -- update --version v1.0.0-alpha.8.6
 ```
 
 Using the bootstrap for an update is intentional: it installs the current CLI,
 host agent and compose healthcheck before pulling/recreating the requested
 Panel image. Calling an older already-installed CLI cannot retroactively know
-about newer host-side lifecycle hooks.
+about newer host-side lifecycle hooks. Scripts hotfix `alpha.8.6.1` also
+restarts already-active host-agent units before heartbeat verification; plain
+`enable --now` cannot refresh a collector whose `ReadWritePaths` mount still
+points at a deleted/recreated SSH core directory.
 
 **The panel (exactly one):** `http://<server-ip>:8000/dashboard/` — the unified
 Zagros dashboard. Cores, routing, outbounds, inbounds, DNS, certificates,
