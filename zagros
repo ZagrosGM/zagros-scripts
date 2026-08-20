@@ -25,7 +25,7 @@
 # =============================================================================
 set -euo pipefail
 
-ZAGROS_CLI_VERSION="1.0.0-alpha.8.6.1"
+ZAGROS_CLI_VERSION="1.0.0-alpha.8.7"
 SCRIPTS_REPO_RAW="https://raw.githubusercontent.com/ZagrosGM/zagros-scripts"
 PANEL_REPO="ZagrosGM/Zagros"
 PANEL_API="https://api.github.com/repos/${PANEL_REPO}"
@@ -292,8 +292,14 @@ services:
     # network mode because that would mutate the host namespace.
     cap_add:
       - NET_ADMIN
+      # Independent ACCEL-PPP PPTP uses GRE protocol 47 raw sockets.
+      - NET_RAW
+      # Per-outbound named network namespaces need mount/setns authority.
+      # The panel still receives neither the Docker socket nor host PID access.
+      - SYS_ADMIN
     devices:
       - /dev/net/tun:/dev/net/tun
+      - /dev/ppp:/dev/ppp
     # Configuration contract: compose only MOUNTS the .env file — NOTHING is
     # injected into the container environment, so the file is the only
     # configuration source. Edit ./.env (or `zagros config edit`), then
@@ -782,6 +788,29 @@ host_tun_preflight() {  # warn-only: host readiness for TUN-based cores
         log_warn "wireguard kernel module not loaded (kernel >= 5.6 ships it; older kernels need wireguard-dkms)"
     fi
 
+    # Independent PPTP is default-disabled, but Compose must be able to mount
+    # the exact PPP character device when an operator opts in later. Loading
+    # these host modules does not start a listener or change firewall/routes.
+    if command -v modprobe >/dev/null 2>&1; then
+        modprobe ppp_generic 2>/dev/null || true
+        modprobe ppp_mppe 2>/dev/null || true
+        modprobe pppox 2>/dev/null || true
+        modprobe pptp 2>/dev/null || true
+        modprobe nf_conntrack_pptp 2>/dev/null || true
+        modprobe nf_nat_pptp 2>/dev/null || true
+    fi
+    if [[ -d /sys/module/ppp_generic && ! -c /dev/ppp ]] && command -v mknod >/dev/null 2>&1; then
+        mknod /dev/ppp c 108 0 2>/dev/null || true
+        chmod 600 /dev/ppp 2>/dev/null || true
+    fi
+    if [[ -d /sys/module/ppp_generic && -d /sys/module/ppp_mppe && -c /dev/ppp ]]; then
+        mkdir -p /etc/modules-load.d 2>/dev/null || true
+        printf 'ppp_generic\nppp_mppe\npppox\npptp\nnf_conntrack_pptp\nnf_nat_pptp\n' > /etc/modules-load.d/zagros-ppp.conf 2>/dev/null || true
+        log_ok "PPP/MPPE ready (/dev/ppp, ppp_generic, ppp_mppe)"
+    else
+        log_warn "PPTP environment unavailable — provider will remain stopped unless /dev/ppp, ppp_generic and ppp_mppe are provided"
+    fi
+
     # The panel uses host networking. Docker correctly mounts host /proc/sys
     # read-only in the container, so wg-quick must NOT try to switch this
     # sysctl after creating the interface. Apply and persist it on the host.
@@ -1034,6 +1063,7 @@ uninstall_filesystem_sweep() {
     rm -rf "$ZAGROS_DATA"   # databases (sqlite/mysql/postgres files), cores,
                             # certificates, TLS keys, runtime data, logs, backups, cache
     rm -rf "$ZAGROS_ETC"     # legacy/config leftovers where present
+    rm -f /etc/modules-load.d/zagros-ppp.conf
     rm -f  "$ZAGROS_BIN/zagros"
     rm -f  "$ZAGROS_LIBEXEC/zagros-host-agent" \
         "$ZAGROS_LIBEXEC/zagros-ssh-accounting-agent"
@@ -1060,6 +1090,7 @@ uninstall_verify() {
     [[ -e "$ZAGROS_HOME" ]] && leftovers+=("$ZAGROS_HOME")
     [[ -e "$ZAGROS_DATA" ]] && leftovers+=("$ZAGROS_DATA")
     [[ -e "$ZAGROS_ETC" ]] && leftovers+=("$ZAGROS_ETC")
+    [[ -e /etc/modules-load.d/zagros-ppp.conf ]] && leftovers+=("/etc/modules-load.d/zagros-ppp.conf")
     [[ -e "$ZAGROS_BIN/zagros" ]] && leftovers+=("$ZAGROS_BIN/zagros")
     [[ -e "$ZAGROS_LIBEXEC/zagros-host-agent" ]] && leftovers+=("$ZAGROS_LIBEXEC/zagros-host-agent")
     [[ -e "$ZAGROS_LIBEXEC/zagros-ssh-accounting-agent" ]] && leftovers+=("$ZAGROS_LIBEXEC/zagros-ssh-accounting-agent")
@@ -1092,6 +1123,7 @@ uninstall_verify() {
             systemctl daemon-reload >/dev/null 2>&1 || true
         fi
         rm -rf "$ZAGROS_HOME" "$ZAGROS_DATA" "$ZAGROS_ETC" "$HOME/.cache/zagros"
+        rm -f /etc/modules-load.d/zagros-ppp.conf
         rm -f "$ZAGROS_BIN/zagros" "$ZAGROS_LIBEXEC/zagros-host-agent" \
             "$ZAGROS_LIBEXEC/zagros-ssh-accounting-agent"
         # final re-check — honesty: fail loudly instead of claiming success
@@ -1099,6 +1131,7 @@ uninstall_verify() {
         [[ -e "$ZAGROS_HOME" ]] && leftovers+=("$ZAGROS_HOME")
         [[ -e "$ZAGROS_DATA" ]] && leftovers+=("$ZAGROS_DATA")
         [[ -e "$ZAGROS_ETC" ]] && leftovers+=("$ZAGROS_ETC")
+        [[ -e /etc/modules-load.d/zagros-ppp.conf ]] && leftovers+=("/etc/modules-load.d/zagros-ppp.conf")
         [[ -e "$ZAGROS_BIN/zagros" ]] && leftovers+=("$ZAGROS_BIN/zagros")
         [[ -e "$ZAGROS_LIBEXEC/zagros-host-agent" ]] && leftovers+=("$ZAGROS_LIBEXEC/zagros-host-agent")
         [[ -e "$ZAGROS_LIBEXEC/zagros-ssh-accounting-agent" ]] && leftovers+=("$ZAGROS_LIBEXEC/zagros-ssh-accounting-agent")
@@ -1212,6 +1245,7 @@ update_apply() {  # update_apply <tag> → 0 ok / 1 fail
     local version="$1"
     env_set ZAGROS_IMAGE_TAG "$version"
     ensure_persistent_core_paths
+    host_tun_preflight
     # The compose TEMPLATE evolves between CLI releases (e.g. 1.0.0-alpha.7.2
     # added /dev/net/tun + NET_ADMIN so TUN-based cores — OpenVPN/WireGuard —
     # can start INSIDE the container). A running install's compose file is
@@ -1743,6 +1777,11 @@ cmd_doctor() {
     else
         dr WARN "wireguard module" "not loaded (modprobe wireguard; kernels < 5.6 need wireguard-dkms)"
     fi
+    if [[ -c /dev/ppp && -d /sys/module/ppp_generic && -d /sys/module/ppp_mppe ]]; then
+        dr OK "pptp kernel" "/dev/ppp + ppp_generic + ppp_mppe available"
+    else
+        dr WARN "pptp kernel" "legacy PPTP unavailable (needs /dev/ppp, ppp_generic, ppp_mppe)"
+    fi
     # The RUNNING container must actually carry the caps the cores need —
     # containers created by an older CLI template keep their old spec until
     # an update force-recreates them (alpha.7.4 field failure pattern).
@@ -1750,10 +1789,11 @@ cmd_doctor() {
         local caps devs
         caps="$(docker inspect --format '{{json .HostConfig.CapAdd}}' "$SERVICE" 2>/dev/null || true)"
         devs="$(docker inspect --format '{{json .HostConfig.Devices}}' "$SERVICE" 2>/dev/null || true)"
-        if [[ "$caps" == *NET_ADMIN* && "$devs" == *net/tun* ]]; then
-            dr OK "container caps" "NET_ADMIN + /dev/net/tun granted"
+        if [[ "$caps" == *NET_ADMIN* && "$caps" == *NET_RAW* && "$caps" == *SYS_ADMIN* \
+                && "$devs" == *net/tun* && "$devs" == *dev/ppp* ]]; then
+            dr OK "container caps" "NET_ADMIN + NET_RAW + SYS_ADMIN + /dev/net/tun + /dev/ppp granted"
         else
-            dr WARN "container caps" "missing NET_ADMIN or /dev/net/tun — TUN cores cannot start; fix: zagros update --force (re-renders compose & recreates)"
+            dr WARN "container caps" "missing required network capability/device — TUN/netns/PPTP providers cannot start; fix: zagros update --force (re-renders compose & recreates)"
         fi
     fi
 
@@ -1981,6 +2021,7 @@ cmd_repair() {
         fi
     done
     ensure_persistent_core_paths
+    host_tun_preflight
 
     db_kind="$(env_get ZAGROS_DB_KIND)"; db_kind="${db_kind:-sqlite}"
     [[ -f "$COMPOSE_FILE" ]] && old_hash="$(sha256sum "$COMPOSE_FILE" | cut -d' ' -f1)"
