@@ -18,11 +18,11 @@ and messages — nothing is simulated; and the stack is **core-agnostic**: no
 core binary is baked into the image, every core self-installs its official
 upstream release at runtime, and no core has a special place anywhere.
 
-> **Status: ALPHA** (`v1.0.0-alpha.8.6.1` host-scripts hotfix for the
-> `v1.0.0-alpha.8.6` Panel). Suitable for evaluation and lab testing. The
-> CLI's semantics are covered by an end-to-end test suite (`tests/`, 267
-> assertions) and the in-container bridge by the panel's pytest suite — read
-> *Verification* below honestly before production use.
+> **Status: ALPHA** (`v1.0.0-alpha.8.7` scripts and Panel). Suitable for
+> evaluation and lab testing. The CLI's semantics are covered by an end-to-end
+> test suite (`tests/`, 269 assertions) and the in-container bridge by the
+> Panel's pytest suite — read *Verification* below honestly before production
+> use.
 
 ---
 
@@ -51,16 +51,14 @@ sudo zagros install-core xray         # self-install an official core binary
 ### Safe update (refresh host scripts before the image)
 
 ```bash
-sudo env ZAGROS_SCRIPTS_REF=v1.0.0-alpha.8.6.1 bash -c "$(curl -fsSL https://raw.githubusercontent.com/ZagrosGM/zagros-scripts/v1.0.0-alpha.8.6.1/zagros.sh)" -- update --version v1.0.0-alpha.8.6
+sudo env ZAGROS_SCRIPTS_REF=v1.0.0-alpha.8.7 bash -c "$(curl -fsSL https://raw.githubusercontent.com/ZagrosGM/zagros-scripts/v1.0.0-alpha.8.7/zagros.sh)" -- update --version v1.0.0-alpha.8.7
 ```
 
 Using the bootstrap for an update is intentional: it installs the current CLI,
-host agent and compose healthcheck before pulling/recreating the requested
-Panel image. Calling an older already-installed CLI cannot retroactively know
-about newer host-side lifecycle hooks. Scripts hotfix `alpha.8.6.1` also
-restarts already-active host-agent units before heartbeat verification; plain
-`enable --now` cannot refresh a collector whose `ReadWritePaths` mount still
-points at a deleted/recreated SSH core directory.
+host agent and Compose contract before pulling/recreating the requested Panel
+image. Calling an older installed CLI cannot retroactively add the `SYS_ADMIN`
+capability required for alpha.8.7's isolated native SoftEther client
+namespaces. The stack still grants no Docker socket and no host PID namespace.
 
 **The panel (exactly one):** `http://<server-ip>:8000/dashboard/` — the unified
 Zagros dashboard. Cores, routing, outbounds, inbounds, DNS, certificates,
@@ -252,7 +250,7 @@ run `zagros backup` first regardless).
 
 * **CI on this repo** (`ci.yml`): ShellCheck (`-S warning`) for all three host
   scripts + `bash tests/test_cli.sh` — an end-to-end harness that drives the
-  **real** CLI through 263 assertions (install → config → admin → cores → backup →
+  **real** CLI through 269 assertions (install → config → admin → cores → backup →
   restore → update → forced-failure rollback → doctor → repair → clean/prune
   → full uninstall & verification) against a faithful docker/compose/hostctl double
   (`tests/faked/`). GitHub runners additionally run the real-VPS E2E below.
@@ -266,9 +264,11 @@ run `zagros backup` first regardless).
   see the main repository).
 
 Limitations: `wireguard/openvpn/softether/ssh` are *privileged* cores and need
-`NET_ADMIN` + kernel support (they run outside the panel container model);
-doctor's firewall check is informational (host firewalling is site-specific);
-`restore` across different database engines is intentionally refused.
+`NET_ADMIN` plus kernel support. Native SoftEther outbound namespaces also
+need `SYS_ADMIN`; the generated Compose grants both while withholding the
+Docker socket and host PID namespace. Doctor's firewall check is informational
+(host firewalling is site-specific); `restore` across different database
+engines is intentionally refused.
 
 ---
 
@@ -294,3 +294,14 @@ README **and** covered by the test suite.
 ## License
 
 [AGPL-3.0](LICENSE) — same as the Zagros panel.
+
+## Optional independent PPTP runtime
+
+The installer prepares (but does not enable) the panel container for Zagros'
+legacy/insecure ACCEL-PPP provider by mounting `/dev/ppp` and granting explicit
+`NET_ADMIN` + `NET_RAW`. It attempts to load `ppp_generic`, `ppp_mppe`, `pppox`,
+`pptp`, `nf_conntrack_pptp`, and `nf_nat_pptp`; no listener starts until the
+provider is explicitly installed,
+configured, enabled and started in the panel. `privileged:true`, Docker socket
+access and host PID access are not used. `zagros doctor` reports missing PPP
+kernel/device support as an environment limitation.

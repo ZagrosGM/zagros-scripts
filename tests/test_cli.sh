@@ -109,8 +109,16 @@ grep -q './.env:/code/.env:ro' "$ZAGROS_HOME/docker-compose.yml" \
 # alpha.7 field reports: openvpn management unreachable, wg-quick failing)
 grep -qE '^\s+- NET_ADMIN$' "$ZAGROS_HOME/docker-compose.yml" \
     && ok "compose grants NET_ADMIN for TUN cores" || bad "compose grants NET_ADMIN for TUN cores"
+grep -qE '^\s+- NET_RAW$' "$ZAGROS_HOME/docker-compose.yml" \
+    && ok "compose grants NET_RAW for independent PPTP GRE" || bad "compose grants NET_RAW for independent PPTP GRE"
+grep -qE '^\s+- SYS_ADMIN$' "$ZAGROS_HOME/docker-compose.yml" \
+    && ok "compose grants SYS_ADMIN for isolated netns" || bad "compose grants SYS_ADMIN for isolated netns"
 grep -q '/dev/net/tun:/dev/net/tun' "$ZAGROS_HOME/docker-compose.yml" \
     && ok "compose passes /dev/net/tun device" || bad "compose passes /dev/net/tun device"
+grep -q '/dev/ppp:/dev/ppp' "$ZAGROS_HOME/docker-compose.yml" \
+    && ok "compose passes /dev/ppp for independent PPTP" || bad "compose passes /dev/ppp for independent PPTP"
+grep -q 'privileged: true' "$ZAGROS_HOME/docker-compose.yml" \
+    && bad "compose must not use privileged mode" || ok "compose avoids privileged mode"
 grep -q 'env_file:' "$ZAGROS_HOME/docker-compose.yml" \
     && bad "panel service has NO env_file injection" || ok "panel service has NO env_file injection"
 grep -q "open('/code/.env'" "$ZAGROS_HOME/docker-compose.yml" \
@@ -321,7 +329,7 @@ printf '#!/usr/bin/env bash\necho stale-cli\n' > "$ZAGROS_BIN/zagros"
 chmod 0755 "$ZAGROS_BIN/zagros"
 run bash "$SH" update --version v9.9.9-test
 expect_rc "bootstrap update rc0" 0
-grep -q 'ZAGROS_CLI_VERSION="1.0.0-alpha.8.6.1"' "$ZAGROS_BIN/zagros" \
+grep -q 'ZAGROS_CLI_VERSION="1.0.0-alpha.8.7"' "$ZAGROS_BIN/zagros" \
     && ok "bootstrap update refreshed installed CLI" || bad "bootstrap update refreshed installed CLI"
 expect_out "update summary" "update complete"
 grep -q '^ZAGROS_IMAGE_TAG=v9.9.9-test$' "$ZAGROS_HOME/.env" \
@@ -340,7 +348,7 @@ expect_rc "bare version accepted (v-prefix normalized)" 0
 # alpha.7.4 (items 2/3): a compose rendered by an OLD template (no
 # /dev/net/tun + NET_ADMIN) must be re-rendered at update time and the
 # container force-recreated — else TUN cores keep dying post-update.
-sed -i '/^  *- NET_ADMIN$/d; /\/dev\/net\/tun:\/dev\/net\/tun/d; /^  *cap_add:$/d; /^  *devices:$/d' \
+sed -i '/^  *- NET_ADMIN$/d; /^  *- SYS_ADMIN$/d; /\/dev\/net\/tun:\/dev\/net\/tun/d; /^  *cap_add:$/d; /^  *devices:$/d' \
     "$ZAGROS_HOME/docker-compose.yml"
 ! grep -q 'net/tun' "$ZAGROS_HOME/docker-compose.yml" \
     && ok "stale (pre-alpha.7.2) compose simulated" || bad "stale (pre-alpha.7.2) compose simulated"
@@ -350,6 +358,8 @@ grep -q '/dev/net/tun:/dev/net/tun' "$ZAGROS_HOME/docker-compose.yml" \
     && ok "update re-rendered compose with TUN device" || bad "update re-rendered compose with TUN device"
 grep -qE '^  *- NET_ADMIN$' "$ZAGROS_HOME/docker-compose.yml" \
     && ok "update re-rendered compose with NET_ADMIN" || bad "update re-rendered compose with NET_ADMIN"
+grep -qE '^  *- SYS_ADMIN$' "$ZAGROS_HOME/docker-compose.yml" \
+    && ok "update re-rendered compose with SYS_ADMIN" || bad "update re-rendered compose with SYS_ADMIN"
 grep -q 'force-recreate' "$FAKE_DOCKER_STATE/invocations.jsonl" \
     && ok "compose change triggered --force-recreate" || bad "compose change triggered --force-recreate"
 n_fr_before=$(grep -c 'force-recreate' "$FAKE_DOCKER_STATE/invocations.jsonl" || true)
