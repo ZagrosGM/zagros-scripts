@@ -18,7 +18,7 @@ and messages — nothing is simulated; and the stack is **core-agnostic**: no
 core binary is baked into the image, every core self-installs its official
 upstream release at runtime, and no core has a special place anywhere.
 
-> **Status: ALPHA** (`v1.0.0-alpha.8.7` scripts and Panel). Suitable for
+> **Status: ALPHA** (`v1.0.0-alpha.8.8` scripts and Panel). Suitable for
 > evaluation and lab testing. The CLI's semantics are covered by an end-to-end
 > test suite (`tests/`, 269 assertions) and the in-container bridge by the
 > Panel's pytest suite — read *Verification* below honestly before production
@@ -51,7 +51,7 @@ sudo zagros install-core xray         # self-install an official core binary
 ### Safe update (refresh host scripts before the image)
 
 ```bash
-sudo env ZAGROS_SCRIPTS_REF=v1.0.0-alpha.8.7 bash -c "$(curl -fsSL https://raw.githubusercontent.com/ZagrosGM/zagros-scripts/v1.0.0-alpha.8.7/zagros.sh)" -- update --version v1.0.0-alpha.8.7
+sudo env ZAGROS_SCRIPTS_REF=v1.0.0-alpha.8.8 bash -c "$(curl -fsSL https://raw.githubusercontent.com/ZagrosGM/zagros-scripts/v1.0.0-alpha.8.8/zagros.sh)" -- update --version v1.0.0-alpha.8.8
 ```
 
 Using the bootstrap for an update is intentional: it installs the current CLI,
