@@ -262,6 +262,7 @@ services:
     container_name: zagros-node
     restart: always
     network_mode: host
+    pid: host
     privileged: true
     env_file:
       - .env
