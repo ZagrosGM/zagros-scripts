@@ -35,12 +35,10 @@ DATA_DIR="/opt/zagros-node"
 ACTION="install"
 IS_INTERACTIVE=0
 
-# Detect if stdin is terminal and no arguments were passed
 if [ -t 0 ] && [ $# -eq 0 ]; then
     IS_INTERACTIVE=1
 fi
 
-# Parse CLI arguments
 while [[ $# -gt 0 ]]; do
   case $1 in
     --name)
@@ -112,7 +110,6 @@ if [ "$ACTION" = "update" ]; then
     exit 0
 fi
 
-# Interactive Prompts if no flags passed
 if [ "$IS_INTERACTIVE" -eq 1 ]; then
     echo -e "${YELLOW}Interactive Mode:${NC} Press Enter to accept default values.\n"
     
@@ -130,7 +127,6 @@ else
     API_PORT="${API_PORT:-62051}"
 fi
 
-# Port validation
 if ! [[ "$SERVICE_PORT" =~ ^[0-9]+$ ]] || [ "$SERVICE_PORT" -lt 1 ] || [ "$SERVICE_PORT" -gt 65535 ]; then
     echo -e "${RED}[✗] Invalid Service Port: ${SERVICE_PORT}${NC}" >&2
     exit 1
@@ -144,7 +140,6 @@ if [ "$SERVICE_PORT" -eq "$API_PORT" ]; then
     exit 1
 fi
 
-# Generate One-Time Registration Token if not provided
 if [ -z "$REGISTRATION_TOKEN" ]; then
     REGISTRATION_TOKEN=$(openssl rand -hex 32)
 fi
@@ -168,6 +163,12 @@ for tool in curl openssl; do
         fi
     fi
 done
+
+# Ensure softether-vpnserver package is installed on host
+if ! command -v vpnserver >/dev/null 2>&1; then
+    echo -e "${BLUE}[*] Installing softether-vpnserver package on host...${NC}"
+    apt-get update -qq && DEBIAN_FRONTEND=noninteractive apt-get install -y -qq softether-vpnserver softether-vpncmd 2>/dev/null || true
+fi
 
 # 2. Setup Data Directory & TLS Certificates
 mkdir -p "$DATA_DIR/certs" "$DATA_DIR/data" "$DATA_DIR/logs"
@@ -216,6 +217,25 @@ ZAGROS_NODE_VERSION=${NODE_VERSION}
 EOF
 chmod 600 "$DATA_DIR/.env"
 
+# Build volume mounts list for docker-compose
+VOLUMES_EXTRA=""
+if [ -f "/usr/bin/vpnserver" ]; then
+    VOLUMES_EXTRA="${VOLUMES_EXTRA}
+      - /usr/bin/vpnserver:/usr/bin/vpnserver:ro"
+fi
+if [ -f "/usr/bin/vpncmd" ]; then
+    VOLUMES_EXTRA="${VOLUMES_EXTRA}
+      - /usr/bin/vpncmd:/usr/bin/vpncmd:ro"
+fi
+if [ -d "/usr/libexec/softether" ]; then
+    VOLUMES_EXTRA="${VOLUMES_EXTRA}
+      - /usr/libexec/softether:/usr/libexec/softether:ro"
+fi
+if [ -d "/usr/lib/softether" ]; then
+    VOLUMES_EXTRA="${VOLUMES_EXTRA}
+      - /usr/lib/softether:/usr/lib/softether:ro"
+fi
+
 # 4. Create docker-compose.yml
 cat << EOF > "$DATA_DIR/docker-compose.yml"
 name: zagros-node
@@ -232,7 +252,7 @@ services:
     volumes:
       - ./data:/var/lib/zagros-node
       - ./certs:/var/lib/zagros-node/certs
-      - ./logs:/var/lib/zagros-node/logs
+      - ./logs:/var/lib/zagros-node/logs${VOLUMES_EXTRA}
 EOF
 chmod 600 "$DATA_DIR/docker-compose.yml"
 
