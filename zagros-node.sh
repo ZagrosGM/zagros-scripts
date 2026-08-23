@@ -140,6 +140,10 @@ fi
 
 FINGERPRINT=$(openssl x509 -noout -fingerprint -sha256 -in "$DATA_DIR/certs/node.crt" | cut -d'=' -f2 | tr -d ':')
 CERT_PEM=$(cat "$DATA_DIR/certs/node.crt")
+REGISTRATION_HASH=""
+if [ -n "$REGISTRATION_TOKEN" ]; then
+    REGISTRATION_HASH=$(printf '%s' "$REGISTRATION_TOKEN" | sha256sum | cut -d' ' -f1)
+fi
 
 # 3. Create .env Configuration
 cat << EOF > "$DATA_DIR/.env"
@@ -150,6 +154,7 @@ ZAGROS_NODE_SERVICE_PORT=${SERVICE_PORT}
 ZAGROS_NODE_PORT=${API_PORT}
 ZAGROS_NODE_DATA=/var/lib/zagros-node
 ZAGROS_NODE_REGISTRATION_TOKEN=${REGISTRATION_TOKEN}
+ZAGROS_NODE_REGISTRATION_HASH=${REGISTRATION_HASH}
 PANEL_URL=${PANEL_URL}
 ZAGROS_NODE_FINGERPRINT=${FINGERPRINT}
 ZAGROS_NODE_VERSION=${NODE_VERSION}
