@@ -171,11 +171,11 @@ if ! command -v vpnserver >/dev/null 2>&1; then
 fi
 
 # 2. Setup Data Directory & TLS Certificates
-mkdir -p "$DATA_DIR/certs" "$DATA_DIR/data" "$DATA_DIR/logs"
-chmod 700 "$DATA_DIR" "$DATA_DIR/data" "$DATA_DIR/certs"
+mkdir -p "$DATA_DIR/certs" "$DATA_DIR/data" "$DATA_DIR/logs" "$DATA_DIR/cores"
+chmod 700 "$DATA_DIR" "$DATA_DIR/data" "$DATA_DIR/certs" "$DATA_DIR/cores"
 
-if [ -f "$DATA_DIR/data/identity.json" ]; then
-    rm -f "$DATA_DIR/data/identity.json" "$DATA_DIR/certs/node.crt" "$DATA_DIR/certs/node.key"
+if [ -f "$DATA_DIR/identity.json" ]; then
+    rm -f "$DATA_DIR/identity.json" "$DATA_DIR/certs/node.crt" "$DATA_DIR/certs/node.key"
 fi
 
 if [ ! -f "$DATA_DIR/certs/node.crt" ] || [ ! -f "$DATA_DIR/certs/node.key" ]; then
@@ -267,9 +267,7 @@ services:
     env_file:
       - .env
     volumes:
-      - ./data:/var/lib/zagros-node
-      - ./certs:/var/lib/zagros-node/certs
-      - ./logs:/var/lib/zagros-node/logs${VOLUMES_EXTRA}
+      - /opt/zagros-node:/var/lib/zagros-node${VOLUMES_EXTRA}
 EOF
 chmod 600 "$DATA_DIR/docker-compose.yml"
 
