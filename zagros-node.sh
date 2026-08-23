@@ -287,29 +287,48 @@ docker compose -f "$DATA_DIR/docker-compose.yml" up -d
 
 # 8. Complete Registration with Zagros Panel if PANEL_URL and TOKEN provided
 if [ -n "$PANEL_URL" ] && [ -n "$REGISTRATION_TOKEN" ]; then
+    echo -e "${BLUE}[*] Waiting for Node API startup...${NC}"
+    for i in {1..10}; do
+        if curl -k -s "https://127.0.0.1:${API_PORT}/v1/health" >/dev/null 2>&1 || curl -k -s "https://127.0.0.1:${API_PORT}/" >/dev/null 2>&1; then
+            break
+        fi
+        sleep 1
+    done
+
     echo -e "${BLUE}[*] Registering with Zagros Panel (${PANEL_URL})...${NC}"
-    # Detect public IP or host
     PUBLIC_IP=$(curl -s -m 5 https://api.ipify.org || curl -s -m 5 https://ifconfig.me || echo "127.0.0.1")
+    
+    # Format cert JSON string
+    ESCAPED_CERT=$(python3 -c "import json, sys; print(json.dumps(sys.stdin.read()))" < "$DATA_DIR/certs/node.crt" 2>/dev/null || echo "\"\"")
+
     PAYLOAD=$(cat << EOF
 {
   "registration_token": "${REGISTRATION_TOKEN}",
   "address": "${PUBLIC_IP}",
   "port": ${SERVICE_PORT},
   "api_port": ${API_PORT},
-  "certificate_pem": $(jq -aRs . <<< "$CERT_PEM"),
+  "certificate_pem": ${ESCAPED_CERT},
   "fingerprint": "${FINGERPRINT}"
 }
 EOF
 )
-    REG_RESP=$(curl -s -k -X POST "${PANEL_URL}/api/zagros/nodes/complete-registration" \
-      -H "Content-Type: application/json" \
-      -d "$PAYLOAD" || true)
 
-    if echo "$REG_RESP" | grep -q '"ok":true'; then
-        echo -e "${GREEN}[✓] Node registered with Zagros Panel successfully!${NC}"
-    else
-        echo -e "${YELLOW}[!] Panel registration response: ${REG_RESP}${NC}"
-    fi
+    for retry in {1..5}; do
+        REG_RESP=$(curl -s -k -X POST "${PANEL_URL}/api/zagros/nodes/complete-registration" \
+          -H "Content-Type: application/json" \
+          -d "$PAYLOAD" || true)
+
+        if echo "$REG_RESP" | grep -q '"ok":true'; then
+            echo -e "${GREEN}[✓] Node registered with Zagros Panel successfully!${NC}"
+            break
+        else
+            if [ $retry -lt 5 ]; then
+                sleep 2
+            else
+                echo -e "${YELLOW}[!] Panel registration response: ${REG_RESP}${NC}"
+            fi
+        fi
+    done
 fi
 
 echo -e "${GREEN}====================================================${NC}"
