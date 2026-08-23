@@ -1,12 +1,14 @@
 #!/usr/bin/env bash
 # =============================================================================
-#  Zagros Node — Official Docker-First Installer Script
-#  Central Script Repository: https://github.com/ZagrosGM/zagros-scripts
+#  Zagros Node — Official Installer Script (Docker-First Architecture)
+#  Repository: https://github.com/ZagrosGM/zagros-scripts
 #
-#  Usage:
+#  Interactive Usage:
+#    curl -sL https://raw.githubusercontent.com/ZagrosGM/Zagros-Node/main/zagros-node.sh | bash
+#
+#  Automated Usage:
 #    curl -fsSL https://raw.githubusercontent.com/ZagrosGM/zagros-scripts/main/zagros-node.sh | \
-#      sudo bash -s -- --name "Germany-01" --panel "https://panel.example.com" \
-#                     --service-port 62050 --api-port 62051 \
+#      sudo bash -s -- --name "Germany-01" --service-port 62050 --api-port 62051 \
 #                     --registration-token "TOKEN"
 # =============================================================================
 
@@ -23,15 +25,22 @@ echo -e "${CYAN}====================================================${NC}"
 echo -e "${CYAN}      Zagros Node Official Docker Installer         ${NC}"
 echo -e "${CYAN}====================================================${NC}"
 
-NODE_NAME="Germany-01"
-SERVICE_PORT="62050"
-API_PORT="62051"
+NODE_NAME=""
+SERVICE_PORT=""
+API_PORT=""
 PANEL_URL=""
 REGISTRATION_TOKEN=""
 NODE_VERSION="v1.0.0-alpha.9"
 DATA_DIR="/opt/zagros-node"
 ACTION="install"
+IS_INTERACTIVE=0
 
+# Detect if stdin is terminal and no arguments were passed
+if [ -t 0 ] && [ $# -eq 0 ]; then
+    IS_INTERACTIVE=1
+fi
+
+# Parse CLI arguments
 while [[ $# -gt 0 ]]; do
   case $1 in
     --name)
@@ -103,6 +112,43 @@ if [ "$ACTION" = "update" ]; then
     exit 0
 fi
 
+# Interactive Prompts if no flags passed
+if [ "$IS_INTERACTIVE" -eq 1 ]; then
+    echo -e "${YELLOW}Interactive Mode:${NC} Press Enter to accept default values.\n"
+    
+    read -p "Node name [Zagros-Node-1]: " input_name
+    NODE_NAME="${input_name:-Zagros-Node-1}"
+
+    read -p "Service port [62050]: " input_service_port
+    SERVICE_PORT="${input_service_port:-62050}"
+
+    read -p "API port [62051]: " input_api_port
+    API_PORT="${input_api_port:-62051}"
+else
+    NODE_NAME="${NODE_NAME:-Germany-01}"
+    SERVICE_PORT="${SERVICE_PORT:-62050}"
+    API_PORT="${API_PORT:-62051}"
+fi
+
+# Port validation
+if ! [[ "$SERVICE_PORT" =~ ^[0-9]+$ ]] || [ "$SERVICE_PORT" -lt 1 ] || [ "$SERVICE_PORT" -gt 65535 ]; then
+    echo -e "${RED}[✗] Invalid Service Port: ${SERVICE_PORT}${NC}" >&2
+    exit 1
+fi
+if ! [[ "$API_PORT" =~ ^[0-9]+$ ]] || [ "$API_PORT" -lt 1 ] || [ "$API_PORT" -gt 65535 ]; then
+    echo -e "${RED}[✗] Invalid API Port: ${API_PORT}${NC}" >&2
+    exit 1
+fi
+if [ "$SERVICE_PORT" -eq "$API_PORT" ]; then
+    echo -e "${RED}[✗] Service Port and API Port cannot be identical!${NC}" >&2
+    exit 1
+fi
+
+# Generate One-Time Registration Token if not provided
+if [ -z "$REGISTRATION_TOKEN" ]; then
+    REGISTRATION_TOKEN=$(openssl rand -hex 32)
+fi
+
 # 1. Install Docker & dependencies if missing
 if ! command -v docker >/dev/null 2>&1; then
     echo -e "${BLUE}[*] Installing Docker...${NC}"
@@ -127,7 +173,7 @@ done
 mkdir -p "$DATA_DIR/certs" "$DATA_DIR/data" "$DATA_DIR/logs"
 chmod 700 "$DATA_DIR" "$DATA_DIR/data" "$DATA_DIR/certs"
 
-if [ -n "$REGISTRATION_TOKEN" ]; then
+if [ -f "$DATA_DIR/data/identity.json" ]; then
     rm -f "$DATA_DIR/data/identity.json" "$DATA_DIR/certs/node.crt" "$DATA_DIR/certs/node.key"
 fi
 
@@ -152,10 +198,7 @@ fi
 
 FINGERPRINT=$(openssl x509 -noout -fingerprint -sha256 -in "$DATA_DIR/certs/node.crt" | cut -d'=' -f2 | tr -d ':')
 CERT_PEM=$(cat "$DATA_DIR/certs/node.crt")
-REGISTRATION_HASH=""
-if [ -n "$REGISTRATION_TOKEN" ]; then
-    REGISTRATION_HASH=$(printf '%s' "$REGISTRATION_TOKEN" | sha256sum | cut -d' ' -f1)
-fi
+REGISTRATION_HASH=$(printf '%s' "$REGISTRATION_TOKEN" | sha256sum | cut -d' ' -f1)
 
 # 3. Create .env Configuration
 cat << EOF > "$DATA_DIR/.env"
@@ -217,14 +260,13 @@ EOF
 systemctl daemon-reload
 systemctl enable zagros-node.service 2>/dev/null || true
 
-# 6. Install CLI Executable (/usr/local/bin/zagros-node)
+# 6. Install CLI Executable (/usr/local/bin/zagros-node & /usr/local/bin/zn)
 cat << 'EOF' > /usr/local/bin/zagros-node
 #!/usr/bin/env bash
-# Zagros Node Official CLI
+# Zagros Node Official CLI — Absolute Paths independent of CWD
 set -euo pipefail
 
 DATA_DIR="/opt/zagros-node"
-
 cmd="${1:-status}"
 shift || true
 
@@ -235,6 +277,11 @@ case "$cmd" in
       grep -E "^(ZAGROS_NODE_NAME|NODE_SERVICE_PORT|NODE_API_PORT|ZAGROS_NODE_VERSION)=" "$DATA_DIR/.env" || true
     fi
     docker ps --filter "name=zagros-node" --format "Container Status: {{.Status}} ({{.Image}})"
+    if [ -f "$DATA_DIR/certs/node.crt" ]; then
+      echo "TLS Certificate: Valid (/opt/zagros-node/certs/node.crt)"
+    else
+      echo "TLS Certificate: Missing"
+    fi
     ;;
   start|up)
     docker compose -f "$DATA_DIR/docker-compose.yml" up -d
@@ -282,7 +329,7 @@ case "$cmd" in
     fi
     ;;
   uninstall)
-    /usr/local/bin/zagros-node stop || true
+    docker compose -f "$DATA_DIR/docker-compose.yml" down 2>/dev/null || true
     systemctl stop zagros-node.service 2>/dev/null || true
     systemctl disable zagros-node.service 2>/dev/null || true
     rm -f /etc/systemd/system/zagros-node.service /usr/local/bin/zagros-node /usr/local/bin/zn
@@ -290,7 +337,7 @@ case "$cmd" in
     echo "Zagros Node uninstalled."
     ;;
   *)
-    echo "Usage: zagros-node {status|start|stop|restart|logs|update|config|doctor|version|uninstall}"
+    echo "Usage: zagros-node {status|start|stop|restart|up|down|logs|update|config|doctor|version|uninstall}"
     ;;
 esac
 EOF
@@ -314,8 +361,6 @@ if [ -n "$PANEL_URL" ] && [ -n "$REGISTRATION_TOKEN" ]; then
 
     echo -e "${BLUE}[*] Registering with Zagros Panel (${PANEL_URL})...${NC}"
     PUBLIC_IP=$(curl -s -m 5 https://api.ipify.org || curl -s -m 5 https://ifconfig.me || echo "127.0.0.1")
-    
-    # Format cert JSON string
     ESCAPED_CERT=$(python3 -c "import json, sys; print(json.dumps(sys.stdin.read()))" < "$DATA_DIR/certs/node.crt" 2>/dev/null || echo "\"\"")
 
     PAYLOAD=$(cat << EOF
@@ -349,11 +394,17 @@ EOF
 fi
 
 echo -e "${GREEN}====================================================${NC}"
-echo -e "${GREEN}  Zagros Node Installed & Started Successfully!     ${NC}"
+echo -e "${GREEN}            Zagros Node Installation                ${NC}"
 echo -e "${GREEN}====================================================${NC}"
-echo -e "Node Name:     ${CYAN}${NODE_NAME}${NC}"
-echo -e "Service Port:  ${CYAN}${SERVICE_PORT}${NC}"
-echo -e "API Port:      ${CYAN}${API_PORT}${NC}"
-echo -e "TLS SHA-256:   ${YELLOW}${FINGERPRINT}${NC}"
-echo -e "CLI Tool:      ${CYAN}zagros-node (or zn)${NC}"
+echo -e "Node Name:                           ${CYAN}${NODE_NAME}${NC}"
+echo -e "Service Port:                        ${CYAN}${SERVICE_PORT}${NC}"
+echo -e "API Port:                            ${CYAN}${API_PORT}${NC}"
+echo -e ""
+echo -e "One-Time Registration Token:"
+echo -e "${YELLOW}${REGISTRATION_TOKEN}${NC}"
+echo -e ""
+echo -e "TLS SHA-256 Certificate Fingerprint:"
+echo -e "${YELLOW}${FINGERPRINT}${NC}"
+echo -e "${GREEN}====================================================${NC}"
+echo -e "${GREEN}Enter these values in Zagros Panel -> Node Management${NC}"
 echo -e "${GREEN}====================================================${NC}"
