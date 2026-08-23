@@ -239,6 +239,18 @@ if [ -d "/usr/share/softether-common" ]; then
     VOLUMES_EXTRA="${VOLUMES_EXTRA}
       - /usr/share/softether-common:/usr/share/softether-common:ro"
 fi
+if [ -f "/usr/sbin/openvpn" ]; then
+    VOLUMES_EXTRA="${VOLUMES_EXTRA}
+      - /usr/sbin/openvpn:/usr/sbin/openvpn:ro"
+fi
+if [ -f "/usr/bin/wg" ]; then
+    VOLUMES_EXTRA="${VOLUMES_EXTRA}
+      - /usr/bin/wg:/usr/bin/wg:ro"
+fi
+if [ -f "/usr/bin/wg-quick" ]; then
+    VOLUMES_EXTRA="${VOLUMES_EXTRA}
+      - /usr/bin/wg-quick:/usr/bin/wg-quick:ro"
+fi
 
 # 4. Create docker-compose.yml
 cat << EOF > "$DATA_DIR/docker-compose.yml"
