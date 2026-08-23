@@ -127,17 +127,25 @@ done
 mkdir -p "$DATA_DIR/certs" "$DATA_DIR/data" "$DATA_DIR/logs"
 chmod 700 "$DATA_DIR" "$DATA_DIR/data" "$DATA_DIR/certs"
 
-if [ -n "$REGISTRATION_TOKEN" ] && [ -f "$DATA_DIR/data/identity.json" ]; then
-    rm -f "$DATA_DIR/data/identity.json"
+if [ -n "$REGISTRATION_TOKEN" ]; then
+    rm -f "$DATA_DIR/data/identity.json" "$DATA_DIR/certs/node.crt" "$DATA_DIR/certs/node.key"
 fi
 
 if [ ! -f "$DATA_DIR/certs/node.crt" ] || [ ! -f "$DATA_DIR/certs/node.key" ]; then
     echo -e "${BLUE}[*] Generating self-signed TLS Certificate...${NC}"
+    PUBLIC_IP=$(curl -s -m 5 https://api.ipify.org || curl -s -m 5 https://ifconfig.me || echo "127.0.0.1")
+    
+    SAN="IP:${PUBLIC_IP}"
+    if [[ ! "$PUBLIC_IP" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+        SAN="DNS:${PUBLIC_IP}"
+    fi
+
     openssl req -x509 -newkey rsa:2048 -nodes \
       -keyout "$DATA_DIR/certs/node.key" \
       -out "$DATA_DIR/certs/node.crt" \
       -days 3650 \
-      -subj "/CN=${NODE_NAME}" >/dev/null 2>&1
+      -subj "/CN=${NODE_NAME}" \
+      -addext "subjectAltName=${SAN},IP:127.0.0.1,DNS:localhost,DNS:${NODE_NAME}" >/dev/null 2>&1
     chmod 600 "$DATA_DIR/certs/node.key"
     chmod 644 "$DATA_DIR/certs/node.crt"
 fi
