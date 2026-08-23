@@ -127,6 +127,10 @@ done
 mkdir -p "$DATA_DIR/certs" "$DATA_DIR/data" "$DATA_DIR/logs"
 chmod 700 "$DATA_DIR" "$DATA_DIR/data" "$DATA_DIR/certs"
 
+if [ -n "$REGISTRATION_TOKEN" ] && [ -f "$DATA_DIR/data/identity.json" ]; then
+    rm -f "$DATA_DIR/data/identity.json"
+fi
+
 if [ ! -f "$DATA_DIR/certs/node.crt" ] || [ ! -f "$DATA_DIR/certs/node.key" ]; then
     echo -e "${BLUE}[*] Generating self-signed TLS Certificate...${NC}"
     openssl req -x509 -newkey rsa:2048 -nodes \
