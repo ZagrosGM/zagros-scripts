@@ -235,6 +235,10 @@ if [ -d "/usr/lib/softether" ]; then
     VOLUMES_EXTRA="${VOLUMES_EXTRA}
       - /usr/lib/softether:/usr/lib/softether:ro"
 fi
+if [ -d "/usr/share/softether-common" ]; then
+    VOLUMES_EXTRA="${VOLUMES_EXTRA}
+      - /usr/share/softether-common:/usr/share/softether-common:ro"
+fi
 
 # 4. Create docker-compose.yml
 cat << EOF > "$DATA_DIR/docker-compose.yml"
