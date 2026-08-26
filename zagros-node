@@ -13,7 +13,7 @@ require_install(){ installed || die "Zagros Node is not installed (run: zagros-n
 help(){ cat <<EOF
 zagros-node $VERSION
 Usage: zagros-node COMMAND
-  install [--token TOKEN] [--name NAME] [--port PORT] [--image IMAGE]
+  install [--token TOKEN] [--name NAME] [--address IP|DNS] [--port PORT] [--image IMAGE]
   update [--image IMAGE]   up | down | restart | status | logs [--no-follow]
   uninstall [--destroy-data] [-y]   version | doctor
   core list | install CORE | uninstall CORE | start CORE | stop CORE |
@@ -24,25 +24,31 @@ EOF
 random_token(){ openssl rand -base64 36 | tr -d '\n'; }
 cmd_install(){
   need_root; installed && die "already installed"
-  local token= name="zagros-node" port=62050 image="ghcr.io/zagrosgm/zagros-node:alpha"
-  while (($#)); do case "$1" in --token) token=$2; shift 2;; --name) name=$2; shift 2;; --port) port=$2; shift 2;; --image) image=$2; shift 2;; *) die "unknown install option: $1";; esac; done
+  local token= name="zagros-node" address= port=62050 image="ghcr.io/zagrosgm/zagros-node:alpha"
+  while (($#)); do case "$1" in --token) token=$2; shift 2;; --name) name=$2; shift 2;; --address) address=$2; shift 2;; --port) port=$2; shift 2;; --image) image=$2; shift 2;; *) die "unknown install option: $1";; esac; done
   command -v docker >/dev/null || die "Docker is required"
   docker compose version >/dev/null || die "Docker Compose plugin is required"
   [[ $port =~ ^[0-9]+$ ]] && ((port>0 && port<65536)) || die "invalid port"
+  [[ -n $address ]] || address=$(hostname -f 2>/dev/null || hostname)
+  [[ $address =~ ^[A-Za-z0-9:._-]+$ ]] || die "invalid node address"
   [[ -n $token ]] || token=$(random_token)
   local hash; hash=$(printf %s "$token" | sha256sum | awk '{print $1}')
   install -d -m 0700 "$HOME_DIR" "$DATA_DIR" /var/lib/zagros/cores
-  curl -fsSL https://raw.githubusercontent.com/ZagrosGM/Zagros/main/node/docker-compose.yml -o "$COMPOSE_FILE"
+  local compose_url=${ZAGROS_NODE_COMPOSE_URL:-https://raw.githubusercontent.com/ZagrosGM/Zagros/main/node/docker-compose.yml}
+  curl -fsSL "$compose_url" -o "$COMPOSE_FILE"
   cat >"$ENV_FILE" <<EOF
 ZAGROS_NODE_IMAGE=$image
 ZAGROS_NODE_NAME=$name
+ZAGROS_NODE_ADDRESS=$address
 ZAGROS_NODE_HOST=0.0.0.0
 ZAGROS_NODE_PORT=$port
 ZAGROS_NODE_DATA=$DATA_DIR
 ZAGROS_CORE_DATA=/var/lib/zagros/cores
 ZAGROS_NODE_REGISTRATION_HASH=$hash
 EOF
-  chmod 0600 "$ENV_FILE"; compose pull; compose up -d
+  chmod 0600 "$ENV_FILE"
+  docker image inspect "$image" >/dev/null 2>&1 || compose pull
+  compose up -d
   # Secret is written once to a root-only file, never passed to Docker/logged.
   printf %s "$token" >"$HOME_DIR/registration-token"; chmod 0600 "$HOME_DIR/registration-token"
   echo "Zagros Node installed. Registration material (root-only):"
@@ -51,10 +57,10 @@ EOF
 }
 cmd_status(){ require_install; compose ps; }
 cmd_logs(){ require_install; [[ ${1:-} == --no-follow ]] && compose logs --tail 200 || compose logs --tail 200 -f; }
-cmd_update(){ need_root; require_install; local image=; while (($#)); do case $1 in --image) image=$2; shift 2;; *) die "unknown update option";; esac; done; [[ -z $image ]] || sed -i "s|^ZAGROS_NODE_IMAGE=.*|ZAGROS_NODE_IMAGE=$image|" "$ENV_FILE"; compose pull; compose up -d --remove-orphans; }
+cmd_update(){ need_root; require_install; local image=; while (($#)); do case $1 in --image) image=$2; shift 2;; *) die "unknown update option";; esac; done; [[ -z $image ]] || sed -i "s|^ZAGROS_NODE_IMAGE=.*|ZAGROS_NODE_IMAGE=$image|" "$ENV_FILE"; local selected; selected=$(sed -n 's/^ZAGROS_NODE_IMAGE=//p' "$ENV_FILE"); docker image inspect "$selected" >/dev/null 2>&1 || compose pull; compose up -d --remove-orphans; }
 cmd_info(){ require_install; local cert="$DATA_DIR/tls/node.crt"; echo "api port: $(sed -n 's/^ZAGROS_NODE_PORT=//p' "$ENV_FILE")"; if [[ -s $cert ]]; then echo "TLS SHA-256: $(openssl x509 -in "$cert" -outform DER | sha256sum | awk '{print $1}')"; else echo "certificate not created yet"; fi; [[ -s $HOME_DIR/registration-token ]] && echo "registration token: $HOME_DIR/registration-token (delete after registration)"; }
 cmd_doctor(){ require_install; local fail=0; for c in docker openssl; do command -v $c >/dev/null || { echo "FAIL $c"; fail=1; }; done; docker compose version >/dev/null || { echo "FAIL compose"; fail=1; }; compose ps; [[ -s $DATA_DIR/tls/node.crt ]] || { echo "FAIL certificate"; fail=1; }; ((fail==0)) && echo "OK node prerequisites and state"; return $fail; }
-cmd_core(){ require_install; local op=${1:-} core=${2:-}; case $op in list) compose exec -T node python -m app.platform.hostctl cores-list;; install|uninstall|start|stop|restart|status|logs) [[ $core =~ ^[a-z0-9][a-z0-9-]{1,31}$ ]] || die "invalid core id"; die "core $op is control-plane only; use the signed Master Node API";; *) die "usage: zagros-node core list|install|uninstall|start|stop|restart|status|logs CORE";; esac; }
+cmd_core(){ require_install; local op=${1:-} core=${2:-}; case $op in list) compose exec -T node python -c 'import json,os; from pathlib import Path; from app.node_agent.app import identity; from app.nodes.client import ZagrosNodeClient; cert=Path(os.environ["ZAGROS_NODE_TLS_CERT"]).read_text(); address=os.environ.get("ZAGROS_NODE_ADDRESS","127.0.0.1"); print(json.dumps(ZagrosNodeClient(address,int(os.environ.get("ZAGROS_NODE_PORT","62050")),identity.node_id,identity.signing_key(),cert).cores()))';; install|uninstall|start|stop|restart|status|logs) [[ $core =~ ^[a-z0-9][a-z0-9-]{1,31}$ ]] || die "invalid core id"; die "core $op is control-plane only; use the signed Master Node API";; *) die "usage: zagros-node core list|install|uninstall|start|stop|restart|status|logs CORE";; esac; }
 cmd_uninstall(){ need_root; require_install; local destroy=0 yes=0; for x in "$@"; do [[ $x == --destroy-data ]] && destroy=1; [[ $x == -y ]] && yes=1; done; ((yes)) || { read -r -p "Remove node software (data preserved unless --destroy-data)? [y/N] " a; [[ $a == [yY] ]] || exit 1; }; compose down; rm -rf "$HOME_DIR"; ((destroy)) && rm -rf "$DATA_DIR" /var/lib/zagros/cores; echo "uninstalled (destroy_data=$destroy)"; }
 main(){ local cmd=${1:-help}; shift || true; case $cmd in help|-h|--help) help;; install) cmd_install "$@";; update) cmd_update "$@";; up|down|restart) need_root; require_install; compose "$cmd";; status) cmd_status;; logs) cmd_logs "$@";; uninstall) cmd_uninstall "$@";; version) echo "$VERSION";; doctor) cmd_doctor;; node) [[ ${1:-} == info ]] || die "usage: zagros-node node info"; cmd_info;; config) require_install; case ${1:-show} in path) echo "$ENV_FILE";; show) sed -E 's/(HASH|TOKEN|KEY)=.*/\1=<redacted>/' "$ENV_FILE";; *) die "usage: config path|show";; esac;; core) cmd_core "$@";; *) help; exit 2;; esac; }
 main "$@"
