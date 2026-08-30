@@ -25,7 +25,7 @@
 # =============================================================================
 set -euo pipefail
 
-ZAGROS_CLI_VERSION="1.0.0-alpha.8.8"
+ZAGROS_CLI_VERSION="1.0.0-alpha.9.1"
 SCRIPTS_REPO_RAW="https://raw.githubusercontent.com/ZagrosGM/zagros-scripts"
 PANEL_REPO="ZagrosGM/Zagros"
 PANEL_API="https://api.github.com/repos/${PANEL_REPO}"
@@ -59,8 +59,10 @@ DB_SERVICE="zagros-db"
 if [[ -t 1 && -z "${NO_COLOR:-}" ]]; then
     C_RED=$'\033[0;31m'; C_GRN=$'\033[0;32m'; C_YEL=$'\033[0;33m'
     C_BLU=$'\033[0;34m'; C_BLD=$'\033[1m';    C_RST=$'\033[0m'
+    C_DIM=$'\033[2m';    C_PNK=$'\033[38;5;213m'
 else
     C_RED=""; C_GRN=""; C_YEL=""; C_BLU=""; C_BLD=""; C_RST=""
+    C_DIM=""; C_PNK=""
 fi
 log_info() { printf '%s[*]%s %s\n'  "$C_BLU" "$C_RST" "$*"; }
 log_ok()   { printf '%s[✓]%s %s\n'  "$C_GRN" "$C_RST" "$*"; }
@@ -2427,73 +2429,129 @@ general_help() {
     cat <<EOF
 ${C_BLD}zagros${C_RST} — Zagros multi-core VPN platform, host management CLI $ZAGROS_CLI_VERSION
 
-Usage: zagros <command> [options]
+Usage: ${C_BLD}zagros <command>${C_RST} [options]   ·   ${C_BLD}zagros advanced <command>${C_RST} for the rest
 
-Service lifecycle:
-  install                 one-command install (--database sqlite|mysql|mariadb|postgresql)
-  update                  pre-backup → pull image → migrate → health (auto-rollback on failure)
-  start / stop / restart  service control — restart recreates the panel and
-                          ALWAYS applies .env edits (Marzban-style contract)
-  up / down               docker compose up -d / down
-  reload                  recreate the panel container (same as restart)
-  status                  service, image, health and core table
-  logs [svc] [--tail N] [--no-follow]
-  version                 CLI, image, panel and latest-release versions
+${C_BLD}main${C_RST}
+  ${C_BLU}up${C_RST}                        ${C_PNK}start the panel (compose up -d)${C_RST}
+  ${C_BLU}down${C_RST}                      ${C_PNK}stop and remove the panel containers${C_RST}
+  ${C_BLU}restart${C_RST}                   ${C_PNK}recreate the panel — always applies .env edits${C_RST}
+  ${C_BLU}status${C_RST}                    ${C_PNK}service, image, health and the core table${C_RST}
+  ${C_BLU}logs${C_RST} ${C_DIM}[svc] [--tail N]${C_RST}     ${C_PNK}follow the panel logs${C_RST}
+  ${C_BLU}update${C_RST}                    ${C_PNK}pre-backup → pull → migrate → health (auto-rollback)${C_RST}
+  ${C_BLU}cores${C_RST}                     ${C_PNK}installed cores: state, version, health${C_RST}
+  ${C_BLU}cores${C_RST} ${C_DIM}install|update|uninstall|reload <core>${C_RST}
+                             ${C_PNK}manage one core (--version X pins a release)${C_RST}
+  ${C_BLU}env${C_RST} ${C_DIM}[show|edit|get K|set K V]${C_RST}
+                             ${C_PNK}the .env — the single source of truth${C_RST}
+  ${C_BLU}backup${C_RST} ${C_DIM}[--logs]${C_RST}           ${C_PNK}full backup: db, config, certs, keys, cores${C_RST}
+  ${C_BLU}restore${C_RST} ${C_DIM}<file|latest>${C_RST}     ${C_PNK}restore a backup${C_RST}
+  ${C_BLU}version${C_RST}                   ${C_PNK}CLI, image, panel and latest-release versions${C_RST}
+  ${C_BLU}help${C_RST}                      ${C_PNK}this help${C_RST}
 
-Operations:
-  doctor [--json]         full system report (docker/db/cores/ports/dns/ghcr/…)
-  health                  quick composite health probe (exit 1 on failure)
-  repair                  safe automatic fixes (dirs, env, image, container, schema)
-  clean [--keep N]        prune old backups
-  prune                   docker image prune + superseded image tags
+${C_BLD}advanced${C_RST} ${C_DIM}— zagros advanced <command>${C_RST}
+  ${C_BLU}install${C_RST}                   ${C_PNK}one-command install (--database sqlite|mysql|mariadb|postgresql)${C_RST}
+  ${C_BLU}uninstall${C_RST} ${C_DIM}[--yes]${C_RST}         ${C_PNK}full removal of containers, images, data and this CLI${C_RST}
+  ${C_BLU}rollback${C_RST} ${C_DIM}[--to <tag>]${C_RST}     ${C_PNK}return to a previous version${C_RST}
+  ${C_BLU}start${C_RST} ${C_DIM}|${C_RST} ${C_BLU}stop${C_RST} ${C_DIM}|${C_RST} ${C_BLU}reload${C_RST}     ${C_PNK}finer service control than up/down/restart${C_RST}
+  ${C_BLU}doctor${C_RST} ${C_DIM}[--json]${C_RST}           ${C_PNK}full system report (docker/db/cores/ports/dns/ghcr)${C_RST}
+  ${C_BLU}health${C_RST}                    ${C_PNK}quick composite health probe (exit 1 on failure)${C_RST}
+  ${C_BLU}repair${C_RST}                    ${C_PNK}safe automatic fixes (dirs, env, image, container, schema)${C_RST}
+  ${C_BLU}shell${C_RST}                     ${C_PNK}exec into the panel container${C_RST}
+  ${C_BLU}migrate${C_RST}                   ${C_PNK}run schema migrations now${C_RST}
+  ${C_BLU}sync${C_RST} ${C_DIM}[--core X]${C_RST}           ${C_PNK}re-apply every stored account to enabled cores${C_RST}
+  ${C_BLU}create-admin${C_RST}              ${C_PNK}create a sudo/normal admin${C_RST}
+  ${C_BLU}reset-admin${C_RST}               ${C_PNK}reset an admin's password${C_RST}
+  ${C_BLU}install-host-agent${C_RST}        ${C_PNK}the Settings → Panel Network apply/rollback agent${C_RST}
+  ${C_BLU}backup-service${C_RST}            ${C_PNK}system-only bundle (compose, env, CLI state)${C_RST}
+  ${C_BLU}clean${C_RST} ${C_DIM}[--keep N]${C_RST}          ${C_PNK}prune old backups${C_RST}
+  ${C_BLU}prune${C_RST}                     ${C_PNK}docker image prune + superseded image tags${C_RST}
 
-Backup & restore:
-  backup [--logs]         full backup (db, config, certs, keys, core metadata, runtime config)
-  backup-service          system-only bundle (compose, env, CLI state)
-  restore <file|latest> [--dry-run] [--yes]
-  rollback [--to <tag>] [--backup <file>]
-  migrate                 run schema migrations now
-
-Core management (capability-driven, no core has a special place):
-  list-cores [--json]     installed cores: state/version/health/capabilities
-  install-core <core>     SELF_INSTALL an official core binary
-  update-core <core>      update a core binary (--version X)
-  uninstall-core <core>   dependency-checked removal (--purge/--force)
-  reload-core <core>      restart a single core (panel-aware)
-  sync [--core X]         re-apply all stored accounts to enabled cores
-
-Admin:
-  create-admin [--username U] [--password P] [--sudo]
-  reset-admin  [--username U] [--password P]
-  install-host-agent      install Settings → Panel Network apply/rollback agent
-
-Configuration (.env is the single source of truth):
-  config                  show the effective config (masked secrets) [default]
-  config show | list      same as above
-  config get KEY          print one value
-  config set KEY VALUE    write one value in place [--force] [--restart]
-  config edit             open .env in \$EDITOR, then restart to apply
-  config reload           validate + restart (applies .env immediately)
-  config validate         sanity-check the .env
-  config path             print the .env location (/opt/zagros/.env)
-  shell                   exec into the panel container
-  uninstall [--yes]       FULL uninstall — containers, images, volumes,
-                          networks, /opt/zagros, /var/lib/zagros (databases,
-                          backups, certificates, logs), /etc/zagros, this CLI
-                          and the root-only host agent. Prints a removal summary
-                          and asks for confirmation.
-
-Everything runs against the REAL services — nothing is simulated.
+${C_DIM}Everything runs against the REAL services — nothing is simulated.
+Advanced commands are also accepted at the top level, so older scripts and
+docs keep working.${C_RST}
 Docs: https://github.com/ZagrosGM/zagros-scripts
 EOF
 }
 
-main() {
-    local cmd="${1:-help}"
+advanced_help() {
+    cat <<EOF
+${C_BLD}zagros advanced${C_RST} <command> [options]
+
+  ${C_BLU}install${C_RST}                   ${C_PNK}one-command install (--database sqlite|mysql|mariadb|postgresql)${C_RST}
+  ${C_BLU}uninstall${C_RST} ${C_DIM}[--yes]${C_RST}         ${C_PNK}full removal of containers, images, data and this CLI${C_RST}
+  ${C_BLU}rollback${C_RST} ${C_DIM}[--to <tag>]${C_RST}     ${C_PNK}return to a previous version${C_RST}
+  ${C_BLU}start${C_RST} ${C_DIM}|${C_RST} ${C_BLU}stop${C_RST} ${C_DIM}|${C_RST} ${C_BLU}reload${C_RST}     ${C_PNK}finer service control than up/down/restart${C_RST}
+  ${C_BLU}doctor${C_RST} ${C_DIM}[--json]${C_RST}           ${C_PNK}full system report (docker/db/cores/ports/dns/ghcr)${C_RST}
+  ${C_BLU}health${C_RST}                    ${C_PNK}quick composite health probe (exit 1 on failure)${C_RST}
+  ${C_BLU}repair${C_RST}                    ${C_PNK}safe automatic fixes (dirs, env, image, container, schema)${C_RST}
+  ${C_BLU}shell${C_RST}                     ${C_PNK}exec into the panel container${C_RST}
+  ${C_BLU}migrate${C_RST}                   ${C_PNK}run schema migrations now${C_RST}
+  ${C_BLU}sync${C_RST} ${C_DIM}[--core X]${C_RST}           ${C_PNK}re-apply every stored account to enabled cores${C_RST}
+  ${C_BLU}create-admin${C_RST}              ${C_PNK}create a sudo/normal admin${C_RST}
+  ${C_BLU}reset-admin${C_RST}               ${C_PNK}reset an admin's password${C_RST}
+  ${C_BLU}install-host-agent${C_RST}        ${C_PNK}the Settings → Panel Network apply/rollback agent${C_RST}
+  ${C_BLU}backup-service${C_RST}            ${C_PNK}system-only bundle (compose, env, CLI state)${C_RST}
+  ${C_BLU}clean${C_RST} ${C_DIM}[--keep N]${C_RST}          ${C_PNK}prune old backups${C_RST}
+  ${C_BLU}prune${C_RST}                     ${C_PNK}docker image prune + superseded image tags${C_RST}
+
+${C_DIM}The everyday commands (up, down, restart, status, logs, update, cores,
+env, backup, restore, version) are at the top level — see: zagros help${C_RST}
+EOF
+}
+
+# `cores` groups the four per-core commands so the top level reads like the
+# things you do to a panel, not like a list of API calls.
+cmd_cores() {
+    local sub="${1:-list}"
     [[ $# -gt 0 ]] && shift || true
-    # Auto-migrate a legacy zagros.env → .env before ANY command touches the
-    # configuration (idempotent, never fatal when not writable).
-    migrate_env_file
+    case "$sub" in
+        list|ls)                cmd_list_cores "$@" ;;
+        install|add)            cmd_install_core "$@" ;;
+        update|upgrade)         cmd_update_core "$@" ;;
+        uninstall|remove|rm)    cmd_uninstall_core "$@" ;;
+        reload|restart)         cmd_reload_core "$@" ;;
+        -h|--help|help)
+            cat <<EOF
+${C_BLD}zagros cores${C_RST} <action> [core] [options]
+
+  ${C_BLU}list${C_RST}                      ${C_PNK}installed cores: state, version, health${C_RST}
+  ${C_BLU}install${C_RST} ${C_DIM}<core>${C_RST}            ${C_PNK}SELF_INSTALL an official core binary${C_RST}
+  ${C_BLU}update${C_RST} ${C_DIM}<core>${C_RST}             ${C_PNK}update a core — --version X pins one release${C_RST}
+  ${C_BLU}uninstall${C_RST} ${C_DIM}<core>${C_RST}          ${C_PNK}dependency-checked removal (--purge/--force)${C_RST}
+  ${C_BLU}reload${C_RST} ${C_DIM}<core>${C_RST}             ${C_PNK}restart a single core (panel-aware)${C_RST}
+EOF
+            ;;
+        *) log_err "unknown cores action: $sub"; echo; cmd_cores help; exit 2 ;;
+    esac
+}
+
+# The .env is the single source of truth; `env` is the short way to reach the
+# same viewer/editor that `config` exposes.
+cmd_env() {
+    local sub="${1:-show}"
+    [[ $# -gt 0 ]] && shift || true
+    case "$sub" in
+        -h|--help|help)
+            cat <<EOF
+${C_BLD}zagros env${C_RST} <action> [args]
+
+  ${C_BLU}show${C_RST}                      ${C_PNK}show the effective config (masked secrets)${C_RST}
+  ${C_BLU}edit${C_RST}                      ${C_PNK}open .env in \$EDITOR, then restart to apply${C_RST}
+  ${C_BLU}get${C_RST} ${C_DIM}KEY${C_RST}                   ${C_PNK}print one value${C_RST}
+  ${C_BLU}set${C_RST} ${C_DIM}KEY VALUE${C_RST}             ${C_PNK}write one value in place [--force] [--restart]${C_RST}
+  ${C_BLU}validate${C_RST}                  ${C_PNK}sanity-check the .env${C_RST}
+  ${C_BLU}path${C_RST}                      ${C_PNK}print the .env location${C_RST}
+  ${C_BLU}reload${C_RST}                    ${C_PNK}validate + restart (applies .env immediately)${C_RST}
+EOF
+            ;;
+        *) cmd_config "$sub" "$@" ;;
+    esac
+}
+
+# Every command, reached either as `zagros <cmd>` or `zagros advanced <cmd>`.
+# The advanced door only exists to keep the front page about running a panel.
+dispatch() {
+    local cmd="$1"; shift
     case "$cmd" in
         install)          cmd_install "$@" ;;
         uninstall)        cmd_uninstall "$@" ;;
@@ -2517,6 +2575,8 @@ main() {
         restore)          cmd_restore "$@" ;;
         migrate)          cmd_migrate "$@" ;;
         config)           cmd_config "$@" ;;
+        env)              cmd_env "$@" ;;
+        cores)            cmd_cores "$@" ;;
         create-admin)     cmd_create_admin "$@" ;;
         reset-admin)      cmd_reset_admin "$@" ;;
         install-host-agent) cmd_install_host_agent "$@" ;;
@@ -2531,6 +2591,33 @@ main() {
         help|--help|-h)   general_help ;;
         *) log_err "unknown command: $cmd"; echo; general_help; exit 2 ;;
     esac
+}
+
+# The commands that are not part of running a panel day to day.
+advanced_main() {
+    local cmd="${1:-help}"
+    [[ $# -gt 0 ]] && shift || true
+    case "$cmd" in
+        -h|--help|help) advanced_help; return 0 ;;
+        install|uninstall|rollback|start|stop|reload|shell|health|doctor|repair|\
+        migrate|config|create-admin|reset-admin|install-host-agent|backup-service|\
+        clean|prune|sync|list-cores|install-core|uninstall-core|update-core|reload-core) ;;
+        *) log_err "'$cmd' is not an advanced command"; echo; advanced_help; exit 2 ;;
+    esac
+    dispatch "$cmd" "$@"
+}
+
+main() {
+    local cmd="${1:-help}"
+    [[ $# -gt 0 ]] && shift || true
+    # Auto-migrate a legacy zagros.env → .env before ANY command touches the
+    # configuration (idempotent, never fatal when not writable).
+    migrate_env_file
+    if [[ "$cmd" == "advanced" ]]; then
+        advanced_main "$@"
+        return $?
+    fi
+    dispatch "$cmd" "$@"
 }
 
 main "$@"

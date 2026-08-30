@@ -10,6 +10,11 @@ management platform.
 * `zagros-host-agent` — the root-only systemd path worker for atomic Panel
   Network Apply, HTTPS health verification and `.env` rollback. The web
   container never receives the Docker socket.
+* `install-node.sh` — the installer for a **node** server (the command the
+  panel's "installer command" button produces). It lives here, not in the
+  agent repository, so installing anything Zagros means fetching from one
+  place.
+* `zagros-node` — the node's host CLI, installed to `/usr/local/bin/zagros-node`.
 
 Design rules: everything the CLI does is **real** (docker/compose for the
 service lifecycle, `python3 -m app.platform.hostctl` inside the container for
@@ -141,8 +146,43 @@ CLI cheatsheet: `zagros config show` (masked overview) ·
 
 ## Command reference
 
-`zagros help` prints the short form. Exit codes: `0` ok, `1` error,
-`2` unknown command.
+`zagros help` prints the short form; running `zagros` with no arguments prints
+it too. Commands are split in two: the **main** ones you use to run a panel,
+and **advanced** ones (`zagros advanced <command>`) for everything else.
+Exit codes: `0` ok, `1` error, `2` unknown command.
+
+Main: `up`, `down`, `restart`, `status`, `logs`, `update`, `cores`, `env`,
+`backup`, `restore`, `version`, `help`.
+Advanced: `install`, `uninstall`, `rollback`, `start`, `stop`, `reload`,
+`shell`, `health`, `doctor`, `repair`, `migrate`, `sync`, `config`,
+`create-admin`, `reset-admin`, `install-host-agent`, `backup-service`,
+`clean`, `prune`. (They are also accepted at the top level, so older scripts
+and docs keep working.)
+
+### Cores (`zagros cores …`)
+
+| Command | Description |
+|---|---|
+| `cores` / `cores list [--json]` | Installed cores: state, version, health, capabilities. |
+| `cores install <core> [--settings JSON] [--no-start]` | SELF_INSTALL an official core binary. |
+| `cores update <core> [--version X]` | Update a core; `--version` pins one release (up or down). |
+| `cores uninstall <core> [--purge] [--force]` | Dependency-checked removal. |
+| `cores reload <core>` | Restart a single core, panel-aware. |
+
+### Configuration (`zagros env …`)
+
+`env` is the short way to reach the same viewer/editor as `config` — the `.env`
+is the single source of truth either way.
+
+| Command | Description |
+|---|---|
+| `env show` | Effective config with secrets masked (default action). |
+| `env edit` | Open `.env` in `$EDITOR`, then restart to apply. |
+| `env get KEY` | Print one value. |
+| `env set KEY VALUE [--force] [--restart]` | Write one value in place. |
+| `env validate` | Sanity-check the `.env`. |
+| `env path` | Print the `.env` location. |
+| `env reload` | Validate + restart — applies `.env` immediately. |
 
 ### Service lifecycle
 
@@ -210,6 +250,43 @@ When a core is running under the live panel process the answer is
 | `config reload` | Validate + restart — applies `.env` immediately. |
 | `config validate` | Catches missing keys, bad ports, invalid `TLS_MODE`, `TLS_MODE=on` without cert/key, and the P3/legacy same-SQLite-file collision. |
 | `config path` | Print the `.env` location. |
+
+---
+
+## Node servers — `install-node.sh` and `zagros-node`
+
+A node runs the agent image
+([`zagros-node`](https://github.com/ZagrosGM/zagros-node)); the installer and
+the host CLI live **here**, next to the panel's own installer. The panel hands
+out the exact command — *Nodes → installer command* — and it looks like this:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/ZagrosGM/zagros-scripts/main/install-node.sh \
+  | bash -s -- --panel-id panel-xxxx --token <ONE-TIME-TOKEN> \
+           --name de-1 --address 203.0.113.10 --port 62050 --api-port 62051
+```
+
+What it does, and nothing else: installs Docker if it is missing, writes
+`/opt/zagros-node/{.env,docker-compose.yml}`, installs the `zagros-node` CLI,
+pulls the image, starts the container and prints the pairing material (node id
+and certificate SHA-256) you confirm in the panel. It is idempotent, and the
+one-time token is never written to disk — only its SHA-256.
+
+Which ref the command points at is decided by the panel: the tag matching its
+own version when that tag exists, otherwise `main`. Override it with
+`ZAGROS_SCRIPTS_REF` (or `ZAGROS_SCRIPTS_REPO_RAW` for a fork).
+
+```bash
+# on the node, once installed
+zagros-node status              # container + core lifecycle state
+zagros-node cores               # cores installed on this node
+zagros-node env edit            # edit the node configuration, then apply
+zagros-node logs -f             # agent log stream
+zagros-node update              # pull the current image and recreate
+zagros-node advanced cert       # certificate paths + the pinned fingerprint
+```
+
+`zagros-node` follows the same main/advanced split as `zagros`.
 
 ---
 

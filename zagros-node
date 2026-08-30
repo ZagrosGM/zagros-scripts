@@ -1,0 +1,262 @@
+#!/usr/bin/env bash
+# ---------------------------------------------------------------------------
+# zagros-node — host CLI for a Zagros node (installed to /usr/local/bin).
+#
+# Container lifecycle is done here; anything that needs the agent's own view
+# (certificate, inventory, pairing) is delegated into the container with
+# `docker exec … python -m node_agent.cli`, so the host needs nothing but
+# Docker and this file.
+#
+# Commands are split in two: the handful you use every day sit at the top
+# level, everything else lives under `advanced` so the help stays readable.
+#   zagros-node up · status · cores · env edit
+#   zagros-node advanced exec sh
+# ---------------------------------------------------------------------------
+set -euo pipefail
+
+DIR="${ZAGROS_NODE_DIR:-/opt/zagros-node}"
+NAME="zagros-node"
+IMAGE_DEFAULT="ghcr.io/zagrosgm/zagros-node:latest"
+
+if [ -t 1 ] && [ -z "${NO_COLOR:-}" ]; then
+  B=$'\033[1m'; D=$'\033[2m'; G=$'\033[32m'; Y=$'\033[33m'; R=$'\033[31m'; C=$'\033[36m'
+  # Descriptions are pink so the command column stays scannable — the eye
+  # lands on the name, the explanation is there when you want it.
+  P=$'\033[38;5;213m'; N=$'\033[0m'
+else
+  B=""; D=""; G=""; Y=""; R=""; C=""; P=""; N=""
+fi
+die() { printf '%serror:%s %s\n' "$R" "$N" "$*" >&2; exit 1; }
+warn(){ printf '%s!%s %s\n' "$Y" "$N" "$*" >&2; }
+
+compose() {
+  if docker compose version >/dev/null 2>&1; then
+    ( cd "$DIR" && docker compose "$@" )
+  else
+    die "docker compose plugin is not installed"
+  fi
+}
+
+require_install() { [ -d "$DIR" ] || die "no installation at $DIR (run the installer first)"; }
+require_running() { docker inspect -f '{{.State.Running}}' "$NAME" 2>/dev/null | grep -q true \
+                      || die "the node is not running (start it with: zagros-node up)"; }
+
+container_env() { # read one variable from the install .env
+  [ -r "$DIR/.env" ] || return 0
+  sed -n "s/^$1=//p" "$DIR/.env" | tail -1
+}
+
+in_container() { docker exec "$NAME" python -m node_agent.cli "$@"; }
+
+# --------------------------------------------------------------------------- #
+# help                                                                        #
+# --------------------------------------------------------------------------- #
+usage() {
+  cat <<USAGE
+${B}zagros-node${N} <command> [args]
+
+${B}main${N}
+  ${C}up${N}                        ${P}start (or create) the node container${N}
+  ${C}down${N}                      ${P}stop and remove the container${N}
+  ${C}restart${N}                   ${P}restart the container${N}
+  ${C}status${N}                    ${P}container + core lifecycle state${N}
+  ${C}logs${N} ${D}[-f|--tail N]${N}        ${P}agent logs (default: last 100 lines)${N}
+  ${C}update${N} ${D}[--image REF]${N}      ${P}pull the current image and recreate the container${N}
+  ${C}cores${N}                     ${P}installed cores and their lifecycle state${N}
+  ${C}info${N}                      ${P}node id, pairing state, core inventory (JSON)${N}
+  ${C}env${N} ${D}[show|edit|set K=V]${N}   ${P}show or edit the node configuration${N}
+  ${C}version${N}                   ${P}agent version${N}
+  ${C}help${N}                      ${P}this help${N}
+
+${B}advanced${N}
+  ${D}zagros-node advanced <command>${N}
+  ${C}exec${N} ${D}<cmd…>${N}               ${P}run a command inside the container${N}
+  ${C}cert${N}                      ${P}certificate paths + the SHA-256 pin the panel pins${N}
+  ${C}reset-registration${N} ${D}HASH${N}   ${P}unpair and accept a new token (HASH = sha256 of it)${N}
+  ${C}uninstall${N} ${D}[--purge]${N}       ${P}stop and remove the node (--purge deletes data)${N}
+
+${D}Run a command's name with --help for its own usage.${N}
+USAGE
+}
+
+advanced_usage() {
+  cat <<USAGE
+${B}zagros-node advanced${N} <command> [args]
+
+  ${C}exec${N} ${D}<cmd…>${N}               ${P}run a command inside the container${N}
+  ${C}cert${N}                      ${P}certificate paths + the SHA-256 pin the panel pins${N}
+  ${C}reset-registration${N} ${D}HASH${N}   ${P}unpair and accept a new token (HASH = sha256 of it)${N}
+  ${C}uninstall${N} ${D}[--purge]${N}       ${P}stop and remove the node (--purge deletes data)${N}
+
+${D}The everyday commands (up, down, status, logs, update, cores, env, info,
+version) are at the top level — see: zagros-node help${N}
+USAGE
+}
+
+[ $# -ge 1 ] || { usage; exit 0; }
+COMMAND="$1"; shift
+
+# `advanced <cmd>` is exactly `<cmd>` with the group named for the reader's
+# benefit — the implementations do not care which door you came in by.
+if [ "$COMMAND" = "advanced" ]; then
+  [ $# -ge 1 ] || { advanced_usage; exit 0; }
+  COMMAND="$1"; shift
+  case "$COMMAND" in
+    -h|--help|help) advanced_usage; exit 0 ;;
+    exec|cert|reset-registration|uninstall) ;;
+    *) die "'$COMMAND' is not an advanced command (try: zagros-node advanced --help)" ;;
+  esac
+fi
+
+case "$COMMAND" in
+  # ---------------------------------------------------------------- main ----
+  up)
+    require_install
+    compose up -d --remove-orphans
+    echo "${G}✓${N} node started"
+    ;;
+  down)
+    require_install
+    compose down --remove-orphans
+    echo "${G}✓${N} node stopped"
+    ;;
+  restart)
+    require_install
+    compose restart
+    echo "${G}✓${N} node restarted"
+    ;;
+  status)
+    require_install
+    if docker inspect -f '{{.State.Running}}' "$NAME" >/dev/null 2>&1; then
+      printf '%scontainer%s %s (%s)\n' "$B" "$N" "$NAME" \
+        "$(docker inspect -f '{{.State.Status}}' "$NAME" 2>/dev/null)"
+      printf '%simage%s     %s\n' "$B" "$N" "$(docker inspect -f '{{.Config.Image}}' "$NAME" 2>/dev/null)"
+    else
+      warn "no container named $NAME"
+    fi
+    require_running
+    in_container status || true
+    ;;
+  logs)
+    require_install
+    if [ "${1:-}" = "-f" ] || [ "${1:-}" = "--follow" ]; then
+      docker logs -f "$NAME"
+    elif [ "${1:-}" = "--tail" ]; then
+      docker logs --tail "${2:-100}" "$NAME"
+    else
+      docker logs --tail 100 "$NAME"
+    fi
+    ;;
+  update)
+    require_install
+    REF="${IMAGE_DEFAULT}"
+    if [ "${1:-}" = "--image" ]; then REF="${2:?--image needs a reference}"; fi
+    if [ -n "$(container_env ZAGROS_NODE_IMAGE)" ]; then
+      REF="$(container_env ZAGROS_NODE_IMAGE)"
+    fi
+    echo "pulling $REF …"
+    docker pull "$REF"
+    sed -i.bak "s#^ZAGROS_NODE_IMAGE=.*#ZAGROS_NODE_IMAGE=$REF#" "$DIR/.env"
+    compose up -d --remove-orphans
+    echo "${G}✓${N} updated to $REF"
+    ;;
+  cores)
+    require_running
+    in_container cores "$@"
+    ;;
+  info)
+    require_running
+    in_container info "$@"
+    ;;
+  env)
+    require_install
+    case "${1:-show}" in
+      show)
+        sed 's/^\(ZAGROS_NODE_REGISTRATION_HASH=\).*/\1<sha256 — token is never stored>/' "$DIR/.env"
+        ;;
+      edit)
+        ED="${EDITOR:-}"
+        [ -n "$ED" ] || ED="$(command -v nano || command -v vi || true)"
+        [ -n "$ED" ] || die "no editor found — set EDITOR, or use: zagros-node env set KEY=VALUE"
+        cp -a "$DIR/.env" "$DIR/.env.bak"
+        if "$ED" "$DIR/.env"; then
+          compose up -d --remove-orphans
+          echo "${G}✓${N} configuration applied (previous copy: $DIR/.env.bak)"
+        else
+          warn "editor exited non-zero — keeping the previous configuration"
+        fi
+        ;;
+      set)
+        shift || true
+        [ $# -ge 1 ] || die "usage: zagros-node env set KEY=VALUE [KEY=VALUE…]"
+        cp -a "$DIR/.env" "$DIR/.env.bak"
+        for pair in "$@"; do
+          KEY="${pair%%=*}"
+          [ "$KEY" != "$pair" ] || die "expected KEY=VALUE, got '$pair'"
+          if grep -q "^$KEY=" "$DIR/.env" 2>/dev/null; then
+            sed -i "s#^$KEY=.*#$pair#" "$DIR/.env"
+          else
+            printf '%s\n' "$pair" >> "$DIR/.env"
+          fi
+          echo "${G}✓${N} $KEY set"
+        done
+        compose up -d --remove-orphans
+        echo "${G}✓${N} configuration applied"
+        ;;
+      *) die "usage: zagros-node env [show|edit|set KEY=VALUE]" ;;
+    esac
+    ;;
+  version)
+    if docker inspect -f '{{.State.Running}}' "$NAME" >/dev/null 2>&1; then
+      in_container version
+    else
+      echo "zagros-node (agent not running)"
+    fi
+    ;;
+
+  # ------------------------------------------------------------ advanced ----
+  exec)
+    require_running
+    docker exec -it "$NAME" "$@"
+    ;;
+  cert)
+    require_running
+    in_container cert "$@"
+    ;;
+  reset-registration)
+    require_running
+    HASH="${1:-}"
+    [ -n "$HASH" ] || die "usage: zagros-node advanced reset-registration <sha256-of-new-token>"
+    in_container reset-registration "$HASH"
+    echo "${G}✓${N} node unpaired — it will accept the next one-time token from a panel"
+    ;;
+  uninstall)
+    PURGE=0
+    [ "${1:-}" = "--purge" ] && PURGE=1
+    require_install
+    if [ "$PURGE" -eq 1 ]; then
+      warn "--purge will delete ALL node data, including installed cores and their state"
+      read -r -p "type 'purge' to continue: " CONFIRM
+      [ "$CONFIRM" = "purge" ] || die "aborted"
+    fi
+    compose down --remove-orphans --volumes 2>/dev/null || true
+    docker rm -f "$NAME" >/dev/null 2>&1 || true
+    if [ "$PURGE" -eq 1 ]; then
+      docker image inspect "$NAME" >/dev/null 2>&1 && docker rmi -f "$NAME" >/dev/null 2>&1 || true
+      rm -rf "${ZAGROS_NODE_HOST_DATA:-/var/lib/zagros}"
+      rm -rf "$DIR"
+      rm -f /usr/local/bin/zagros-node
+      echo "${G}✓${N} node removed and all data purged"
+    else
+      echo "${G}✓${N} node stopped and removed (data kept at ${ZAGROS_NODE_HOST_DATA:-/var/lib/zagros})"
+    fi
+    ;;
+
+  -h|--help|help)
+    usage
+    ;;
+  *)
+    # A command that moved under `advanced` should say so, not 404.
+    die "unknown command: $COMMAND (try: zagros-node help)"
+    ;;
+esac

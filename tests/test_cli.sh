@@ -71,7 +71,16 @@ say() { printf '\n== %s\n' "$*"; }
 # ----------------------------------------------------------------------------- #
 say "t01 help / dispatcher / exit codes"
 run bash "$CLI" help;            expect_rc "help exits 0" 0
-expect_out "help lists commands" "Service lifecycle:"
+expect_out "help lists main commands" "start the panel (compose up -d)"
+expect_out "help lists the core group" "installed cores: state, version, health"
+expect_out "help lists the env group" "the single source of truth"
+expect_out "help names the advanced door" "zagros advanced <command>"
+run bash "$CLI" advanced;        expect_rc "advanced help exits 0" 0
+expect_out "advanced help lists doctor" "full system report"
+run bash "$CLI" cores --help;    expect_rc "cores help exits 0" 0
+expect_out "cores help lists actions" "SELF_INSTALL an official core binary"
+run bash "$CLI" env --help;      expect_rc "env help exits 0" 0
+expect_out "env help lists edit" 'open .env in $EDITOR'
 run bash "$CLI" definitely-not-a-command; expect_rc "unknown command exits 2" 2
 expect_out "unknown command message" "unknown command"
 run bash "$SH" not-a-command;     expect_rc "bootstrap rejects unknown command" 1
@@ -329,8 +338,13 @@ printf '#!/usr/bin/env bash\necho stale-cli\n' > "$ZAGROS_BIN/zagros"
 chmod 0755 "$ZAGROS_BIN/zagros"
 run bash "$SH" update --version v9.9.9-test
 expect_rc "bootstrap update rc0" 0
-grep -q 'ZAGROS_CLI_VERSION="1.0.0-alpha.8.8"' "$ZAGROS_BIN/zagros" \
-    && ok "bootstrap update refreshed installed CLI" || bad "bootstrap update refreshed installed CLI"
+# Compare against the repository copy: the test must not hardcode a version
+# that the next release will bump.
+if [[ "$(grep -m1 '^ZAGROS_CLI_VERSION=' "$CLI")" == "$(grep -m1 '^ZAGROS_CLI_VERSION=' "$ZAGROS_BIN/zagros")" ]]; then
+    ok "bootstrap update refreshed installed CLI"
+else
+    bad "bootstrap update refreshed installed CLI"
+fi
 expect_out "update summary" "update complete"
 grep -q '^ZAGROS_IMAGE_TAG=v9.9.9-test$' "$ZAGROS_HOME/.env" \
     && ok "env tag flipped" || bad "env tag flipped"
