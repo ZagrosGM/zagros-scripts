@@ -162,7 +162,9 @@ case "$COMMAND" in
     ;;
   cores)
     require_running
-    in_container cores "$@"
+    # The agent's own CLI reports the core inventory under `status`; there is
+    # no `cores` subcommand inside the container.
+    in_container status "$@"
     ;;
   info)
     require_running
