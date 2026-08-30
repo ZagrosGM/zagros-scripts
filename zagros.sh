@@ -20,9 +20,16 @@ set -euo pipefail
 REPO_RAW="https://raw.githubusercontent.com/ZagrosGM/zagros-scripts"
 REF="${ZAGROS_SCRIPTS_REF:-main}"
 
-err() { printf '\033[0;31m[✗]\033[0m %s\n' "$*" >&2; exit 1; } \
-    2>/dev/null || { printf '[x] %s\n' "$*" >&2; exit 1; }
-inf() { printf '\033[0;34m[*]\033[0m %s\n' "$*" 2>/dev/null || printf '[*] %s\n' "$*"; }
+# NB: a redirection on a function *definition* applies to its body, so the
+# old `err() { … } 2>/dev/null` silently threw away every error this script
+# prints — including "run as root". Colour is chosen once, not per call.
+if [[ -t 2 && -z "${NO_COLOR:-}" ]]; then
+    C_ERR=$'\033[0;31m'; C_INF=$'\033[0;34m'; C_OFF=$'\033[0m'
+else
+    C_ERR=""; C_INF=""; C_OFF=""
+fi
+err() { printf '%s[✗]%s %s\n' "$C_ERR" "$C_OFF" "$*" >&2; exit 1; }
+inf() { printf '%s[*]%s %s\n' "$C_INF" "$C_OFF" "$*"; }
 
 [[ "$(id -u)" -eq 0 ]] || err "run as root: sudo bash -c \"\$(curl -fsSL $REPO_RAW/$REF/zagros.sh)\" -- install"
 command -v curl >/dev/null 2>&1 || err "'curl' is required (apt/dnf/yum install curl)"
