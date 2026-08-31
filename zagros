@@ -25,7 +25,7 @@
 # =============================================================================
 set -euo pipefail
 
-ZAGROS_CLI_VERSION="1.0.0-alpha.9.1"
+ZAGROS_CLI_VERSION="1.0.0-alpha.9.4"
 SCRIPTS_REPO_RAW="https://raw.githubusercontent.com/ZagrosGM/zagros-scripts"
 PANEL_REPO="ZagrosGM/Zagros"
 PANEL_API="https://api.github.com/repos/${PANEL_REPO}"
@@ -715,6 +715,12 @@ EOF
             || log_warn "restart watcher inactive — a restore will ask you to run \`zagros restart\` by hand"
         touch "$ZAGROS_DATA/host-actions/.agent-ready"
         chmod 0600 "$ZAGROS_DATA/host-actions/.agent-ready"
+        # The panel decides whether the host can restart it by reading this
+        # file, and the agent only writes it when it runs. Publish it here so
+        # a restore can ask for a restart immediately after an install.
+        printf '%s\n' '{"version":2,"actions":["apply-network","restart-panel"]}' \
+            > "$ZAGROS_DATA/host-actions/.agent-capabilities"
+        chmod 0644 "$ZAGROS_DATA/host-actions/.agent-capabilities"
         log_ok "host agents active; SSH accounting heartbeat is fresh"
     else
         if [[ "$SYSTEMD_DIR" != "/etc/systemd/system" ]]; then
