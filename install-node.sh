@@ -236,6 +236,70 @@ chmod +x "$CLI_PATH"
 ok "installed the CLI at $CLI_PATH"
 
 # --------------------------------------------------------------------------- #
+step "Host SSH accounting"
+# --------------------------------------------------------------------------- #
+# The SSH core accounts traffic from the host's socket table. ``ss`` inside the
+# node container sees only the container's network namespace, so the numbers
+# have to be collected by a small read-only agent on the HOST and handed to the
+# core as a file.
+#
+# That agent existed only in the panel's installer, which is why a node's SSH
+# core sat at "degraded" forever telling you to run a command a node does not
+# have. The node shares /var/lib/zagros, so the panel's own collector works
+# here unchanged.
+ACCT_DIR="$DATA_DIR/cores/ssh"
+mkdir -p "$ACCT_DIR" /usr/local/libexec 2>/dev/null || true
+if curl -fsSL "$REPO_RAW/$REF/zagros-ssh-accounting-agent" \
+        -o /usr/local/libexec/zagros-ssh-accounting-agent 2>/dev/null; then
+    chmod 0755 /usr/local/libexec/zagros-ssh-accounting-agent
+    ok "SSH accounting collector installed"
+else
+    warn "could not download the SSH accounting collector — the SSH core will report degraded usage"
+fi
+
+if command -v systemctl >/dev/null 2>&1 && [ -d /run/systemd/system ]; then
+    ACCT_ENV_DIR=/etc/systemd/system/zagros-ssh-accounting.service.d
+    mkdir -p "$ACCT_ENV_DIR"
+    printf '%s\n' \
+        '[Service]' \
+        "Environment=ZAGROS_SSH_ACCOUNTING_DIR=$ACCT_DIR" \
+        > "$ACCT_ENV_DIR/10-node-data-dir.conf"
+    cat > /etc/systemd/system/zagros-ssh-accounting.service <<EOF
+[Unit]
+Description=Zagros read-only SSH transport accounting collector
+After=docker.service
+
+[Service]
+Type=simple
+ExecStart=/usr/local/libexec/zagros-ssh-accounting-agent
+Restart=always
+RestartSec=2
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=yes
+ReadWritePaths=$ACCT_DIR
+CapabilityBoundingSet=CAP_DAC_READ_SEARCH CAP_SYS_PTRACE
+AmbientCapabilities=CAP_DAC_READ_SEARCH CAP_SYS_PTRACE
+RestrictAddressFamilies=AF_NETLINK AF_UNIX
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+
+[Install]
+WantedBy=multi-user.target
+EOF
+    chmod 0644 /etc/systemd/system/zagros-ssh-accounting.service
+    systemctl daemon-reload >/dev/null 2>&1 || true
+    if systemctl enable --now zagros-ssh-accounting.service >/dev/null 2>&1; then
+        ok "SSH accounting collector running"
+    else
+        warn "could not start zagros-ssh-accounting.service — SSH usage will stay degraded"
+    fi
+else
+    warn "no systemd on this host — start the collector by hand if you use the SSH core"
+fi
+
+# --------------------------------------------------------------------------- #
 step "Obtaining the node image"
 # --------------------------------------------------------------------------- #
 if [ -n "$LOCAL_BUILD" ]; then
