@@ -236,6 +236,38 @@ chmod +x "$CLI_PATH"
 ok "installed the CLI at $CLI_PATH"
 
 # --------------------------------------------------------------------------- #
+step "PPP kernel modules (PPTP core)"
+# --------------------------------------------------------------------------- #
+# The PPTP core tunnels through the HOST kernel, so the modules have to be
+# loaded there — a container cannot load them, and the core's preflight
+# refuses to start without MPPE. Every mainstream host kernel ships these;
+# they are simply not loaded until something asks for them.
+PPP_MODULES="ppp_generic pppox pptp ppp_mppe"
+PPP_MISSING=""
+for mod in $PPP_MODULES; do
+    if [ ! -d "/sys/module/$mod" ]; then
+        if modprobe "$mod" >/dev/null 2>&1 && [ -d "/sys/module/$mod" ]; then
+            ok "loaded $mod"
+        else
+            PPP_MISSING="$PPP_MISSING $mod"
+            warn "could not load $mod — the PPTP core will refuse to start"
+        fi
+    else
+        ok "already loaded: $mod"
+    fi
+done
+if [ -z "$PPP_MISSING" ]; then
+    # make it survive a reboot, or the core fails again after the next one
+    if mkdir -p /etc/modules-load.d 2>/dev/null; then
+        : > /etc/modules-load.d/zagros-pptp.conf
+        for mod in $PPP_MODULES; do printf '%s\n' "$mod" >> /etc/modules-load.d/zagros-pptp.conf; done
+        ok "PPP modules will load on boot"
+    else
+        warn "could not write /etc/modules-load.d — load the modules by hand after a reboot"
+    fi
+fi
+
+# --------------------------------------------------------------------------- #
 step "Host SSH accounting"
 # --------------------------------------------------------------------------- #
 # The SSH core accounts traffic from the host's socket table. ``ss`` inside the
