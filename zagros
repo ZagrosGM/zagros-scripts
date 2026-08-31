@@ -645,6 +645,20 @@ Unit=zagros-host-agent.service
 [Install]
 WantedBy=multi-user.target
 EOF
+
+    # A restore writes a restart request (the panel cannot restart itself);
+    # the same agent handles it, so one service owns every privileged action.
+    cat > "$SYSTEMD_DIR/zagros-host-agent-restart.path" <<EOF
+[Unit]
+Description=Watch Zagros host restart requests
+
+[Path]
+PathChanged=$ZAGROS_DATA/host-actions/panel-restart.request.json
+Unit=zagros-host-agent.service
+
+[Install]
+WantedBy=multi-user.target
+EOF
     cat > "$SYSTEMD_DIR/zagros-ssh-accounting.service" <<EOF
 [Unit]
 Description=Zagros read-only SSH transport accounting collector
@@ -687,12 +701,18 @@ EOF
             && [[ -d /run/systemd/system ]] \
             && systemctl daemon-reload \
             && systemctl enable --now zagros-host-agent.path \
+                zagros-host-agent-restart.path \
                 zagros-ssh-accounting.service >/dev/null \
             && systemctl restart zagros-ssh-accounting.service \
             && systemctl restart zagros-host-agent.path \
+            && systemctl restart zagros-host-agent-restart.path \
             && systemctl is-active --quiet zagros-host-agent.path \
             && systemctl is-active --quiet zagros-ssh-accounting.service \
             && wait_ssh_accounting_snapshot; then
+        # The restart watcher is additive: an older agent without it keeps
+        # Panel Network working, it just cannot restart after a restore.
+        systemctl is-active --quiet zagros-host-agent-restart.path \
+            || log_warn "restart watcher inactive — a restore will ask you to run \`zagros restart\` by hand"
         touch "$ZAGROS_DATA/host-actions/.agent-ready"
         chmod 0600 "$ZAGROS_DATA/host-actions/.agent-ready"
         log_ok "host agents active; SSH accounting heartbeat is fresh"

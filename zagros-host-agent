@@ -16,12 +16,59 @@ LOCK="$ACTION_DIR/.apply.lock"
 
 mkdir -p "$ACTION_DIR"
 chmod 700 "$ACTION_DIR"
+
+# Advertise what this build can do. The panel checks this before offering a
+# restart (older agents simply do not have the file, which reads as "unknown").
+write_capabilities() {
+  local tmp="$ACTION_DIR/.agent-capabilities.part"
+  jq -n '{version:2, actions:["apply-network","restart-panel"]}' > "$tmp" 2>/dev/null || return 0
+  chmod 644 "$tmp"; mv "$tmp" "$ACTION_DIR/.agent-capabilities"
+}
+write_capabilities
+
+RESTART_REQUEST="$ACTION_DIR/panel-restart.request.json"
+RESTART_RESULT="$ACTION_DIR/panel-restart.result.json"
+
 exec 9>"$LOCK"
 flock -n 9 || exit 0
-[[ -s "$REQUEST" ]] || exit 0
 [[ $EUID -eq 0 ]] || { echo "host agent must run as root" >&2; exit 1; }
 command -v jq >/dev/null
 command -v docker >/dev/null
+
+# --- restart-panel ------------------------------------------------------- #
+# A restore replaces the databases underneath the running process; only the
+# host can recreate the container. Never touches .env or published ports.
+if [[ -s "$RESTART_REQUEST" ]]; then
+  r_version="$(jq -er '.version' "$RESTART_REQUEST" 2>/dev/null || echo 0)"
+  r_action="$(jq -er '.action' "$RESTART_REQUEST" 2>/dev/null || echo "")"
+  r_at="$(jq -er '.requested_at' "$RESTART_REQUEST" 2>/dev/null || echo 0)"
+  r_now="$(date +%s)"
+  r_op="$(jq -r '.operation_id // "restart"' "$RESTART_REQUEST" 2>/dev/null || echo restart)"
+  if [[ "$r_version" != 1 || "$r_action" != "restart-panel" ]]; then
+    rm -f "$RESTART_REQUEST"; exit 1
+  fi
+  # A stale file must not restart the panel every time the agent is triggered.
+  if (( r_at > r_now + 60 || r_now - r_at > 600 )); then
+    rm -f "$RESTART_REQUEST"; exit 0
+  fi
+  rm -f "$RESTART_REQUEST"
+  r_status=failed; r_message="could not recreate the panel container"
+  if (cd "$ZAGROS_HOME" && docker compose --env-file "$ENV_FILE" up -d --force-recreate zagros >/dev/null 2>&1); then
+    for _ in $(seq 1 90); do
+      r_state="$(docker inspect -f '{{if .State.Health}}{{.State.Health.Status}}{{else}}{{.State.Status}}{{end}}' zagros 2>/dev/null || true)"
+      [[ "$r_state" == healthy || "$r_state" == running ]] && { r_status=ok; r_message="panel recreated and healthy"; break; }
+      [[ "$r_state" == exited || "$r_state" == dead ]] && { r_message="panel container exited after restart"; break; }
+      sleep 2
+    done
+  fi
+  jq -n --arg operation_id "$r_op" --arg status "$r_status" --arg message "$r_message" \
+    '{operation_id:$operation_id,status:$status,message:$message,completed_at:(now|floor)}' \
+    > "$RESTART_RESULT.part"
+  chmod 600 "$RESTART_RESULT.part"; mv "$RESTART_RESULT.part" "$RESTART_RESULT"
+  exit 0
+fi
+
+[[ -s "$REQUEST" ]] || exit 0
 
 operation="$(jq -er '.operation_id | select(type=="string" and length>=16)' "$REQUEST")"
 version="$(jq -er '.version' "$REQUEST")"
