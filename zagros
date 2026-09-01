@@ -863,6 +863,32 @@ host_tun_preflight() {  # warn-only: host readiness for TUN-based cores
     fi
 }
 
+INSTALL_COMPLETE=0
+
+install_failure_cleanup() {
+    # Best-effort teardown of a FRESH partial install. cmd_install refuses to
+    # run when $ENV_FILE already exists, so everything here was created by the
+    # run that just failed and nothing pre-existing is at risk.
+    local rc=$?
+    trap - EXIT
+    (( rc == 0 )) && return 0
+    (( INSTALL_COMPLETE )) && return 0
+    log_warn "install failed — removing the partial installation"
+    if [[ -f "$COMPOSE_FILE" ]]; then
+        compose_probe
+        "${COMPOSE[@]}" -f "$COMPOSE_FILE" --env-file "$ENV_FILE" \
+            down --remove-orphans --volumes >/dev/null 2>&1 || true
+    fi
+    local c
+    while read -r c; do
+        [[ -n "$c" ]] || continue
+        docker rm -f "$c" >/dev/null 2>&1 || true
+    done < <(docker ps -a --format '{{.Names}}' 2>/dev/null | grep '^zagros' || true)
+    rm -rf "$ZAGROS_HOME" "$ZAGROS_DATA" "$ZAGROS_ETC"
+    log_err "the host is back to a clean state — fix the cause and run install again"
+    exit "$rc"
+}
+
 cmd_install() {
     local db_kind="sqlite" version="" channel="stable"
     while (($#)); do
@@ -897,6 +923,13 @@ cmd_install() {
 
     [[ -n "$version" ]] || version="$(resolve_version "$channel")"
     log_info "Image: $IMAGE_REPO:$version"
+
+    # From here on the install mutates the host. A failure used to leave the
+    # .env behind without ever installing the CLI, so the operator could
+    # neither re-run install ("already installed") nor uninstall (no command).
+    # Undo the partial install instead of stranding the host.
+    INSTALL_COMPLETE=0
+    trap install_failure_cleanup EXIT
 
     render_env "$db_kind" "$version"
     render_compose "$db_kind"
@@ -937,6 +970,8 @@ cmd_install() {
     printf '%s\n' "{\"version\": \"$version\", \"db\": \"$db_kind\", \"installed_utc\": \"$(date -u +%Y-%m-%dT%H:%M:%SZ)\"}" \
         > "$STATE_DIR/install.json"
 
+    INSTALL_COMPLETE=1
+    trap - EXIT
     log_ok "Zagros $(panel_version) is running (image $version)"
     cat <<EOF
 
