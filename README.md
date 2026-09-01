@@ -23,9 +23,9 @@ and messages — nothing is simulated; and the stack is **core-agnostic**: no
 core binary is baked into the image, every core self-installs its official
 upstream release at runtime, and no core has a special place anywhere.
 
-> **Status: ALPHA** (`v1.0.0-alpha.8.8` scripts and Panel). Suitable for
-> evaluation and lab testing. The CLI's semantics are covered by an end-to-end
-> test suite (`tests/`, 269 assertions) and the in-container bridge by the
+> **Status: BETA.** Suitable for evaluation and lab testing. The CLI's
+> semantics are covered by an end-to-end test suite (269 assertions, kept in
+> [zagros-devkit](https://github.com/ZagrosGM/zagros-devkit)) and the in-container bridge by the
 > Panel's pytest suite — read *Verification* below honestly before production
 > use.
 
@@ -56,13 +56,13 @@ sudo zagros install-core xray         # self-install an official core binary
 ### Safe update (refresh host scripts before the image)
 
 ```bash
-sudo env ZAGROS_SCRIPTS_REF=v1.0.0-alpha.8.8 bash -c "$(curl -fsSL https://raw.githubusercontent.com/ZagrosGM/zagros-scripts/v1.0.0-alpha.8.8/zagros.sh)" -- update --version v1.0.0-alpha.8.8
+sudo bash -c "$(curl -fsSL https://raw.githubusercontent.com/ZagrosGM/zagros-scripts/main/zagros.sh)" -- update
 ```
 
 Using the bootstrap for an update is intentional: it installs the current CLI,
 host agent and Compose contract before pulling/recreating the requested Panel
 image. Calling an older installed CLI cannot retroactively add the `SYS_ADMIN`
-capability required for alpha.8.7's isolated native SoftEther client
+capability required by the isolated native SoftEther client
 namespaces. The stack still grants no Docker socket and no host PID namespace.
 
 **The panel (exactly one):** `http://<server-ip>:8000/dashboard/` — the unified
@@ -70,7 +70,7 @@ Zagros dashboard. Cores, routing, outbounds, inbounds, DNS, certificates,
 sessions and devices are all managed there, and the Config Studio lives
 inside it as *Settings → Advanced Mode*. There is deliberately **no second
 panel** (the legacy `/zagros/dashboard` and `/zagros/studio` routes were
-removed in `v1.0.0-alpha.5` and return 404).
+removed and now return 404).
 
 ### What `install` does (exactly, and nothing else)
 
@@ -127,7 +127,7 @@ Same operator model as Marzban, with its sharp edges removed:
   stale settings.
 * `UVICORN_HOST` is honored **verbatim** — the runtime never rewrites it
   (the historical "forced to 127.0.0.1 without TLS" trap is fixed in the
-  panel as of `v1.0.0-alpha.4`).
+  panel).
 * `TLS_MODE`: `auto` (default; TLS when both SSL files are set), `on`
   (require TLS, refuse to boot without it), `off` (force plain HTTP for
   reverse-proxy setups).
@@ -326,11 +326,12 @@ run `zagros backup` first regardless).
 ## Verification (honest status)
 
 * **CI on this repo** (`ci.yml`): ShellCheck (`-S warning`) for all three host
-  scripts + `bash tests/test_cli.sh` — an end-to-end harness that drives the
+  scripts, plus the CLI harness from
+  [zagros-devkit](https://github.com/ZagrosGM/zagros-devkit), which drives the
   **real** CLI through 269 assertions (install → config → admin → cores → backup →
   restore → update → forced-failure rollback → doctor → repair → clean/prune
-  → full uninstall & verification) against a faithful docker/compose/hostctl double
-  (`tests/faked/`). GitHub runners additionally run the real-VPS E2E below.
+  → full uninstall & verification) against a faithful docker/compose/hostctl
+  double. GitHub runners additionally run the real-VPS E2E below.
 * **Real-VPS E2E** (`e2e.yml`, `workflow_dispatch`): boots a fresh
   `ubuntu-latest` machine, runs the **real** one-liner install from GHCR,
   creates an admin, probes health/doctor, installs a core, does a full
@@ -354,7 +355,10 @@ engines is intentionally refused.
 ```bash
 bash -n zagros zagros.sh                  # syntax
 shellcheck -x -S warning zagros zagros.sh # lint
-bash tests/test_cli.sh                    # end-to-end CLI logic (no docker needed)
+
+# the end-to-end CLI harness lives in the devkit repository
+git clone https://github.com/ZagrosGM/zagros-devkit.git
+bash zagros-devkit/zagros-scripts/tests/test_cli.sh
 ```
 
 Contributions welcome; keep the honesty contract: no TODOs, no placeholders,
