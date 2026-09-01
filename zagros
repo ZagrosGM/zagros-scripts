@@ -320,8 +320,11 @@ YAML
 )
     case "$db_kind" in
         mysql|mariadb)
-            local img="mysql:8.4"
-            [[ "$db_kind" == "mariadb" ]] && img="mariadb:11.5"
+            local img="mysql:8.4" ping="mysqladmin"
+            # MariaDB 11 dropped the mysql*-named client symlinks, so its
+            # image only ships mariadb-admin; probing with mysqladmin there
+            # never succeeds and the database is declared unhealthy.
+            [[ "$db_kind" == "mariadb" ]] && { img="mariadb:11.5"; ping="mariadb-admin"; }
             db_svc=$(cat <<YAML
 
   zagros-db:
@@ -340,7 +343,7 @@ YAML
     volumes:
       - __DATA_DIR__/db:/var/lib/mysql
     healthcheck:
-      test: ["CMD", "mysqladmin", "ping", "-h", "127.0.0.1", "--port=\${ZAGROS_DB_PORT:-3306}", "--silent", "--password=\${ZAGROS_DB_ROOT_PASSWORD:?set ZAGROS_DB_ROOT_PASSWORD in .env}"]
+      test: ["CMD", "$ping", "ping", "-h", "127.0.0.1", "--port=\${ZAGROS_DB_PORT:-3306}", "--silent", "--password=\${ZAGROS_DB_ROOT_PASSWORD:?set ZAGROS_DB_ROOT_PASSWORD in .env}"]
       interval: 10s
       timeout: 5s
       retries: 12
@@ -529,6 +532,17 @@ EOF
     chmod 600 "$ENV_FILE"
 }
 
+db_client() {  # db_client <shell|dump> — the client binary for the active engine
+    # MariaDB 11 removed the mysql*-named client symlinks, so the MariaDB
+    # image ships only mariadb / mariadb-dump / mariadb-admin. MySQL keeps
+    # the historical names. Both clients honour MYSQL_PWD.
+    if [[ "$(env_get ZAGROS_DB_KIND)" == "mariadb" ]]; then
+        case "$1" in dump) printf 'mariadb-dump' ;; *) printf 'mariadb' ;; esac
+    else
+        case "$1" in dump) printf 'mysqldump' ;; *) printf 'mysql' ;; esac
+    fi
+}
+
 provision_legacy_db() {  # second database on the managed db server
     local db_kind; db_kind="$(env_get ZAGROS_DB_KIND)"
     case "$db_kind" in
@@ -536,7 +550,7 @@ provision_legacy_db() {  # second database on the managed db server
             local root_pw
             root_pw="$(env_get ZAGROS_DB_ROOT_PASSWORD)"
             docker exec -e MYSQL_PWD="$root_pw" "$DB_SERVICE" \
-                mysql -h127.0.0.1 --port="$(env_get ZAGROS_DB_PORT)" -uroot \
+                "$(db_client shell)" -h127.0.0.1 --port="$(env_get ZAGROS_DB_PORT)" -uroot \
                 -e "CREATE DATABASE IF NOT EXISTS zagros_legacy CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci; GRANT ALL PRIVILEGES ON zagros_legacy.* TO '$(env_get ZAGROS_DB_USER)'@'%'; FLUSH PRIVILEGES;"
             ;;
         postgresql)
@@ -1510,9 +1524,9 @@ do_backup() {  # do_backup [--logs|--no-logs] → echoes archive path
             local root_pw
             root_pw="$(env_get ZAGROS_DB_ROOT_PASSWORD)"
             docker exec -e MYSQL_PWD="$root_pw" "$DB_SERVICE" \
-                mysqldump -h127.0.0.1 --port="$port" -uroot --single-transaction --routines --triggers \
+                "$(db_client dump)" -h127.0.0.1 --port="$port" -uroot --single-transaction --routines --triggers \
                 --databases zagros zagros_legacy > "$staging/db/databases.sql" \
-                || { rm -rf "$staging"; log_err "mysqldump failed"; return 1; }
+                || { rm -rf "$staging"; log_err "$(db_client dump) failed"; return 1; }
             ;;
         postgresql)
             port="$(env_get ZAGROS_DB_PORT)"
@@ -1740,7 +1754,7 @@ restore_apply() {  # restore_apply <staging> <db_kind> → 0/1
             root_pw="$(env_get ZAGROS_DB_ROOT_PASSWORD)"
             provision_legacy_db
             docker exec -i -e MYSQL_PWD="$root_pw" "$DB_SERVICE" \
-                mysql -h127.0.0.1 --port="$port" -uroot < "$staging/db/databases.sql" || return 1
+                "$(db_client shell)" -h127.0.0.1 --port="$port" -uroot < "$staging/db/databases.sql" || return 1
             ;;
         postgresql)
             compose up -d "$DB_SERVICE" >/dev/null 2>&1 || true
