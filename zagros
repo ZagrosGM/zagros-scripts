@@ -25,7 +25,7 @@
 # =============================================================================
 set -euo pipefail
 
-ZAGROS_CLI_VERSION="1.0.0-beta.4"
+ZAGROS_CLI_VERSION="1.0.0-beta.5"
 SCRIPTS_REPO_RAW="https://raw.githubusercontent.com/ZagrosGM/zagros-scripts"
 PANEL_REPO="ZagrosGM/Zagros"
 PANEL_API="https://api.github.com/repos/${PANEL_REPO}"
@@ -1012,7 +1012,7 @@ zagros install — one-command installation
 Examples:
   sudo bash -c "\$(curl -fsSL $SCRIPTS_REPO_RAW/main/zagros.sh)" -- install
   zagros install --database postgresql
-  zagros install --database mysql --version v1.0.0-beta.4
+  zagros install --database mysql --version v1.0.0-beta.5
 EOF
 }
 
