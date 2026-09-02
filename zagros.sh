@@ -8,6 +8,10 @@
 #      -- install [--database sqlite|mysql|mariadb|postgresql] [--version <tag>]
 #    sudo bash -c "$(curl -fsSL <this-url>)" -- update [--version <tag>]
 #
+#  Without --version the panel runs the floating `latest` image tag, which
+#  the release workflow moves on every stable release; `--version vX.Y.Z`
+#  pins one release.
+#
 #  This file is intentionally thin: it fetches the full management CLI
 #  (`zagros`) matching the requested source ref and hands control to it, so
 #  ALL logic lives in one place (`zagros`), versioned and testable.

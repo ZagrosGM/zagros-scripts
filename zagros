@@ -213,21 +213,56 @@ version_gt() {  # version_gt A B → true if A > B (dotted numeric compare)
     return 1
 }
 
-# resolve_version [stable|latest] — newest release tag from GitHub; falls back
-# to the currently installed tag, then to the literal 'latest'
-resolve_version() {
-    local channel="${1:-stable}" json tag
-    if json="$(curl -fsS --max-time 20 "$PANEL_API/releases?per_page=30" 2>/dev/null)"; then
-        if [[ "$channel" == "stable" ]]; then
-            tag="$(printf '%s' "$json" | jq -r '[.[] | select(.prerelease == false)][0].tag_name // empty' 2>/dev/null)"
-        fi
-        [[ -n "${tag:-}" ]] || tag="$(printf '%s' "$json" | jq -r '.[0].tag_name // empty' 2>/dev/null)"
-        [[ -n "$tag" && "$tag" != "null" ]] && { printf '%s' "$tag"; return 0; }
+# newest_release_tag [stable|any] — newest release tag published on GitHub
+# (empty when the API is unreachable). Display / currency checks only.
+newest_release_tag() {
+    local channel="${1:-stable}" json tag=""
+    json="$(curl -fsS --max-time 20 "$PANEL_API/releases?per_page=30" 2>/dev/null)" || return 1
+    if [[ "$channel" == "stable" ]]; then
+        tag="$(printf '%s' "$json" | jq -r '[.[] | select(.prerelease == false)][0].tag_name // empty' 2>/dev/null)"
     fi
-    local cur
-    cur="$(env_get ZAGROS_IMAGE_TAG)"
-    [[ -n "$cur" ]] && { printf '%s' "$cur"; return 0; }
-    printf 'latest'
+    [[ -n "$tag" ]] || tag="$(printf '%s' "$json" | jq -r '.[0].tag_name // empty' 2>/dev/null)"
+    [[ -n "$tag" && "$tag" != "null" ]] || return 1
+    printf '%s' "$tag"
+}
+
+# resolve_version [stable|prerelease] — the image tag to deploy when no
+# --version is given. The stable channel is the floating `latest` tag (the
+# release workflow moves it only for stable releases), so a host follows
+# releases with a plain `zagros update` and no GitHub API round-trip;
+# `prerelease` asks GitHub for the newest tag of any kind and falls back to
+# the installed tag, then to `latest`.
+resolve_version() {
+    local channel="${1:-stable}" tag cur
+    case "$channel" in
+        stable|latest) printf 'latest'; return 0 ;;
+        prerelease|pre)
+            if tag="$(newest_release_tag any)"; then printf '%s' "$tag"; return 0; fi
+            cur="$(env_get ZAGROS_IMAGE_TAG)"
+            [[ -n "$cur" ]] && { printf '%s' "$cur"; return 0; }
+            printf 'latest'; return 0 ;;
+        *) die "unknown channel: $channel (expected stable | prerelease)" ;;
+    esac
+}
+
+# image_version_label <tag> — the release the local image was built from
+# (org.opencontainers.image.version, set by the release workflow). Empty when
+# the image is not pulled or carries no version-shaped label. This is what
+# makes a floating tag honest: status/version/doctor print it, and a failed
+# update of `latest` rolls back to it.
+image_version_label() {
+    local label
+    label="$(docker image inspect "$IMAGE_REPO:$1" \
+        --format '{{index .Config.Labels "org.opencontainers.image.version"}}' 2>/dev/null || true)"
+    [[ "$label" =~ ^v?[0-9] ]] && printf '%s' "$label"
+    return 0
+}
+
+# describe_image <tag> — "latest (v1.0.0)" / "v1.0.0" for log lines
+describe_image() {
+    local tag="$1" label
+    label="$(image_version_label "$tag")"
+    if [[ -n "$label" && "$label" != "$tag" ]]; then printf '%s (%s)' "$tag" "$label"; else printf '%s' "$tag"; fi
 }
 
 ghcr_token() {
@@ -239,9 +274,12 @@ ghcr_token() {
 ghcr_remote_digest() {  # ghcr_remote_digest <tag> → sha256:… (empty on failure)
     local tag="$1" token
     token="$(ghcr_token 2>/dev/null)" || return 1
+    # The release image is a single-platform OCI manifest (no index): GHCR
+    # answers 404 unless that media type is acceptable too, which made this
+    # check report "registry not reachable" on every host.
     curl -fsSI --max-time 20 \
         -H "Authorization: Bearer $token" \
-        -H "Accept: application/vnd.oci.image.index.v1+json,application/vnd.docker.distribution.manifest.list.v2+json,application/vnd.docker.distribution.manifest.v2+json" \
+        -H "Accept: application/vnd.oci.image.index.v1+json,application/vnd.oci.image.manifest.v1+json,application/vnd.docker.distribution.manifest.list.v2+json,application/vnd.docker.distribution.manifest.v2+json" \
         "https://ghcr.io/v2/zagrosgm/zagros/manifests/$tag" 2>/dev/null \
         | grep -i '^docker-content-digest:' | awk '{print $2}' | tr -d '\r'
 }
@@ -936,6 +974,7 @@ cmd_install() {
     fi
 
     [[ -n "$version" ]] || version="$(resolve_version "$channel")"
+    [[ "$version" == v* || "$version" == latest ]] || version="v$version"
     log_info "Image: $IMAGE_REPO:$version"
 
     # From here on the install mutates the host. A failure used to leave the
@@ -981,12 +1020,12 @@ cmd_install() {
 
     install_cli_file
     install_host_agent_files
-    printf '%s\n' "{\"version\": \"$version\", \"db\": \"$db_kind\", \"installed_utc\": \"$(date -u +%Y-%m-%dT%H:%M:%SZ)\"}" \
+    printf '%s\n' "{\"version\": \"$version\", \"image_version\": \"$(image_version_label "$version")\", \"db\": \"$db_kind\", \"installed_utc\": \"$(date -u +%Y-%m-%dT%H:%M:%SZ)\"}" \
         > "$STATE_DIR/install.json"
 
     INSTALL_COMPLETE=1
     trap - EXIT
-    log_ok "Zagros $(panel_version) is running (image $version)"
+    log_ok "Zagros $(panel_version) is running (image $(describe_image "$version"))"
     cat <<EOF
 
 Next steps:
@@ -1005,14 +1044,15 @@ install_help() {
 zagros install — one-command installation
 
   --database sqlite|mysql|mariadb|postgresql   database engine (default: sqlite)
-  --version <tag>     pin the panel image tag (default: newest GitHub release)
-  --channel stable|latest   release channel when no --version given
+  --version <tag>     pin one release (default: the floating 'latest' image tag,
+                      which follows stable releases — 'zagros update' moves with it)
+  --channel stable|prerelease   when no --version is given: 'latest' (default)
+                      or the newest pre-release tag published on GitHub
   --no-docker-install       do not auto-install Docker when missing
 
 Examples:
   sudo bash -c "\$(curl -fsSL $SCRIPTS_REPO_RAW/main/zagros.sh)" -- install
   zagros install --database postgresql
-  zagros install --database mysql --version v1.0.0-beta.7
 EOF
 }
 
@@ -1266,16 +1306,19 @@ cmd_update() {
     [[ -n "$version" ]] || version="$(resolve_version "$channel")"
     # release tags are published as vX.Y.Z — accept the bare numeric form too
     [[ "$version" == v* || "$version" == latest ]] || version="v$version"
-    local current
+    local current current_version
     current="$(env_get ZAGROS_IMAGE_TAG)"
-    log_step "Zagros update: ${current:-unknown} → $version"
+    # the release the running image was built from — a floating tag can only
+    # be rolled back to that
+    current_version="$(image_version_label "${current:-latest}")"
+    log_step "Zagros update: $(describe_image "${current:-unknown}") → $version"
 
     if [[ "$current" == "$version" && "$force" == "0" ]]; then
         local remote local_d
         remote="$(ghcr_remote_digest "$version" 2>/dev/null || true)"
         local_d="$(local_image_digest "$version" 2>/dev/null || true)"
         if [[ -n "$remote" && "$remote" == "$local_d" ]]; then
-            log_ok "already up to date ($version, digest identical)"; return 0
+            log_ok "already up to date ($(describe_image "$version"), digest identical)"; return 0
         fi
         log_info "same tag but digest differs (or unverifiable) — pulling fresh image"
     fi
@@ -1287,16 +1330,16 @@ cmd_update() {
         log_ok "backup: $backup_path"
     fi
 
-    printf '%s\n' "{\"from_tag\": \"$current\", \"to_tag\": \"$version\", \"started_utc\": \"$(date -u +%Y-%m-%dT%H:%M:%SZ)\", \"backup\": \"$backup_path\"}" \
+    printf '%s\n' "{\"from_tag\": \"$current\", \"from_version\": \"$current_version\", \"to_tag\": \"$version\", \"started_utc\": \"$(date -u +%Y-%m-%dT%H:%M:%SZ)\", \"backup\": \"$backup_path\"}" \
         > "$STATE_DIR/last-update.json"
 
     if update_apply "$version"; then
-        log_ok "update complete → $(panel_version) (image $version)"
-        printf '%s\n' "$(jq --arg t "$(date -u +%Y-%m-%dT%H:%M:%SZ)" '. + {finished_utc: $t, result: "ok"}' "$STATE_DIR/last-update.json")" \
+        log_ok "update complete → $(panel_version) (image $(describe_image "$version"))"
+        printf '%s\n' "$(jq --arg t "$(date -u +%Y-%m-%dT%H:%M:%SZ)" --arg v "$(image_version_label "$version")" '. + {finished_utc: $t, to_version: $v, result: "ok"}' "$STATE_DIR/last-update.json")" \
             > "$STATE_DIR/last-update.json"
     else
         log_err "update to $version FAILED — rolling back to ${current:-previous state}"
-        rollback_update "$current" "$backup_path"
+        rollback_update "$current" "$current_version" "$backup_path"
         die "update failed and was rolled back. See: zagros logs"
     fi
 }
@@ -1351,8 +1394,23 @@ update_apply() {  # update_apply <tag> → 0 ok / 1 fail
     return 0
 }
 
-rollback_update() {  # rollback_update <prev-tag> <backup>
-    local prev="$1" backup="$2"
+rollback_target() {  # rollback_target <prev-tag> <prev-version> → tag to pin
+    # `latest` is what we just failed to move to; the previous image cannot
+    # be reached by that name any more. The release workflow publishes every
+    # image under its release tag as well, so the version label of the
+    # previous image is the exact same bits — pin that.
+    local prev="$1" prev_version="$2"
+    if [[ "$prev" == "latest" && -n "$prev_version" ]]; then
+        [[ "$prev_version" == v* ]] || prev_version="v$prev_version"   # GHCR tags are vX.Y.Z
+        printf '%s' "$prev_version"
+    else
+        printf '%s' "$prev"
+    fi
+}
+
+rollback_update() {  # rollback_update <prev-tag> <prev-version> <backup>
+    local prev backup
+    prev="$(rollback_target "$1" "$2")"; backup="$3"
     if [[ -n "$prev" ]]; then
         env_set ZAGROS_IMAGE_TAG "$prev"
         compose pull >/dev/null 2>&1 || true
@@ -1384,7 +1442,8 @@ cmd_rollback() {
         esac
     done
     if [[ -z "$to_tag" && -f "$STATE_DIR/last-update.json" ]]; then
-        to_tag="$(jq -r '.from_tag // empty' "$STATE_DIR/last-update.json")"
+        to_tag="$(rollback_target "$(jq -r '.from_tag // empty' "$STATE_DIR/last-update.json")" \
+                                  "$(jq -r '.from_version // empty' "$STATE_DIR/last-update.json")")"
         backup="${backup:-$(jq -r '.backup // empty' "$STATE_DIR/last-update.json")}"
     fi
     [[ -n "$to_tag" ]] || die "nothing recorded to roll back to (no .state/last-update.json) — pass --to <tag> or --backup <file>"
@@ -1447,7 +1506,7 @@ cmd_status() {
     tag="$(env_get ZAGROS_IMAGE_TAG)"; version="$(panel_version)"
     health_status="$(docker inspect --format '{{if .State.Health}}{{.State.Health.Status}}{{else}}container: {{.State.Status}}{{end}}' "$SERVICE" 2>/dev/null || echo "not running")"
     printf '  %-22s %s\n' "panel version:" "$version"
-    printf '  %-22s %s\n' "image:" "$IMAGE_REPO:${tag:-unknown}"
+    printf '  %-22s %s\n' "image:" "$IMAGE_REPO:$(describe_image "${tag:-unknown}")"
     printf '  %-22s %s\n' "health:" "$health_status"
     printf '  %-22s %s\n' "database:" "$(env_get ZAGROS_DB_KIND)"
     printf '  %-22s %s\n' "config file:" "$ENV_FILE"
@@ -1486,15 +1545,14 @@ cmd_health() {
 cmd_version() {
     printf 'zagros CLI     %s\n' "$ZAGROS_CLI_VERSION"
     if [[ -f "$ENV_FILE" ]]; then
-        printf 'image tag      %s\n' "$(env_get ZAGROS_IMAGE_TAG)"
+        printf 'image tag      %s\n' "$(describe_image "$(env_get ZAGROS_IMAGE_TAG)")"
         if docker inspect "$SERVICE" >/dev/null 2>&1; then
             printf 'panel version  %s\n' "$(panel_version)"
         fi
     fi
-    local latest
-    latest="$(resolve_version latest 2>/dev/null || true)"
-    if [[ -n "$latest" ]]; then
-        printf 'latest release %s\n' "$latest"
+    local newest
+    if newest="$(newest_release_tag any 2>/dev/null)"; then
+        printf 'newest release %s\n' "$newest"
     fi
 }
 
@@ -1893,11 +1951,14 @@ cmd_doctor() {
         dr FAIL "image" "$IMAGE_REPO:$tag not pulled — zagros repair or update"
     fi
 
-    # --- version currency
-    local latest_rel
-    if latest_rel="$(resolve_version latest 2>/dev/null)"; then
-        if [[ "$latest_rel" == "$tag" ]]; then dr OK "release currency" "$tag is the newest release"
-        else dr WARN "release currency" "installed=$tag newest=$latest_rel — zagros update"; fi
+    # --- version currency: a floating tag is judged by the release its image
+    # was built from (version label), a pinned tag by itself
+    local installed_rel newest_rel channel
+    installed_rel="$(image_version_label "$tag")"; installed_rel="${installed_rel:-$tag}"
+    channel=stable; [[ "$installed_rel" == *-* ]] && channel=any
+    if newest_rel="$(newest_release_tag "$channel" 2>/dev/null)"; then
+        if [[ "$newest_rel" == "$installed_rel" ]]; then dr OK "release currency" "$installed_rel is the newest release"
+        else dr WARN "release currency" "installed=$installed_rel newest=$newest_rel — zagros update"; fi
     else
         dr WARN "github releases" "api.github.com unreachable — cannot check for updates"
     fi
@@ -2092,7 +2153,7 @@ cmd_repair() {
             case "$k" in
                 ZAGROS_DB_KIND)   env_set "$k" sqlite ;;
                 UVICORN_PORT)     env_set "$k" 8000 ;;
-                ZAGROS_IMAGE_TAG) env_set "$k" "$(resolve_version latest)" ;;
+                ZAGROS_IMAGE_TAG) env_set "$k" "$(resolve_version stable)" ;;
             esac
             log_ok "repaired missing key $k"
         fi
@@ -2485,13 +2546,15 @@ cmd_prune() {
     require_root; require_installed
     ensure_cmd jq jq
     log_step "Prune: dangling images + superseded panel image tags"
-    local current previous
+    local current previous previous_version
     current="$(env_get ZAGROS_IMAGE_TAG)"
     previous="$(jq -r '.from_tag // empty' "$STATE_DIR/last-update.json" 2>/dev/null || true)"
+    # the rollback target of a floating tag is the previous release tag
+    previous_version="$(jq -r '.from_version // empty' "$STATE_DIR/last-update.json" 2>/dev/null || true)"
     docker image prune -f >/dev/null
     local removed=0 img
     while IFS= read -r img; do
-        [[ -z "$img" || "$img" == "$current" || "$img" == "$previous" || "$img" == "<none>" ]] && continue
+        [[ -z "$img" || "$img" == "$current" || "$img" == "$previous" || "$img" == "$previous_version" || "$img" == "<none>" ]] && continue
         docker rmi "$IMAGE_REPO:$img" >/dev/null 2>&1 && removed=$((removed+1)) || true
     done < <(docker images "$IMAGE_REPO" --format '{{.Tag}}')
     log_ok "pruned ($removed old image tags removed; kept current=$current${previous:+, previous=$previous} for rollback)"
@@ -2512,7 +2575,8 @@ ${C_BLD}main${C_RST}
   ${C_BLU}restart${C_RST}                   ${C_PNK}recreate the panel — always applies .env edits${C_RST}
   ${C_BLU}status${C_RST}                    ${C_PNK}service, image, health and the core table${C_RST}
   ${C_BLU}logs${C_RST} ${C_DIM}[svc] [--tail N]${C_RST}     ${C_PNK}follow the panel logs${C_RST}
-  ${C_BLU}update${C_RST}                    ${C_PNK}pre-backup → pull → migrate → health (auto-rollback)${C_RST}
+  ${C_BLU}update${C_RST} ${C_DIM}[--version <tag>]${C_RST}  ${C_PNK}pre-backup → pull → migrate → health (auto-rollback)${C_RST}
+                            ${C_PNK}default: the floating 'latest' image (stable releases)${C_RST}
   ${C_BLU}cores${C_RST}                     ${C_PNK}installed cores: state, version, health${C_RST}
   ${C_BLU}cores${C_RST} ${C_DIM}install|update|uninstall|reload <core>${C_RST}
                              ${C_PNK}manage one core (--version X pins a release)${C_RST}

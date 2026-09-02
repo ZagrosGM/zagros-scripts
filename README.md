@@ -80,9 +80,11 @@ removed and now return 404).
    panel service + optional `zagros-db`) and `/opt/zagros/.env`
    (`0600`, generated secrets — credentials are never printed or passed on
    any command line, and the compose file itself stays secret-free).
-3. Resolves the newest GitHub release tag (override: `--version vX.Y.Z`,
-   `--channel stable|latest`), pulls `ghcr.io/zagrosgm/zagros:<tag>` and
-   starts the stack.
+3. Pulls `ghcr.io/zagrosgm/zagros:latest` — the floating tag the release
+   workflow moves on every **stable** release — and starts the stack. Pin one
+   release with `--version vX.Y.Z` (pre-releases are only reachable this way,
+   or with `--channel prerelease`). `status` / `version` / `doctor` always
+   print the release the running image was built from, next to the tag.
 4. With mysql/mariadb/postgresql: waits for the database, then provisions
    the second `zagros_legacy` database (split-schema design).
 5. Waits for panel health, runs `alembic upgrade head`, verifies the schema
@@ -188,8 +190,8 @@ is the single source of truth either way.
 
 | Command | Description |
 |---|---|
-| `install [--database sqlite\|mysql\|mariadb\|postgresql] [--version <tag>] [--channel stable\|latest] [--no-docker-install]` | One-command installation (see above). |
-| `update [--version <tag>] [--channel stable\|latest] [--no-backup] [--force] [-y]` | Pre-backup → tag/GHCR-digest check → pull → migrate → health gate → **auto-rollback on failure**. |
+| `install [--database sqlite\|mysql\|mariadb\|postgresql] [--version <tag>] [--channel stable\|prerelease] [--no-docker-install]` | One-command installation (see above). Default image tag: `latest`. |
+| `update [--version <tag>] [--channel stable\|prerelease] [--no-backup] [--force] [-y]` | Pre-backup → tag/GHCR-digest check → pull → migrate → health gate → **auto-rollback on failure**. Without `--version` it follows `latest`; a failed move of `latest` rolls back to the exact release the previous image was built from. |
 | `start` / `stop` | Classic service control with health wait. |
 | `restart` | Recreate the panel — **always applies `.env` edits** (health gate). |
 | `up` / `down` | `compose up -d` / `compose down` (data preserved). |
@@ -197,7 +199,7 @@ is the single source of truth either way.
 | `status` | Panel version, image tag, health, db kind, listeners, core table. |
 | `logs [zagros\|zagros-db] [--tail N] [--no-follow]` | Service logs (follows by default). |
 | `shell` | `exec` into the panel container (`bash`, falls back to `sh`). |
-| `version` | CLI, image tag, panel version, newest release. |
+| `version` | CLI, image tag (with the release behind `latest`), panel version, newest release. |
 | `uninstall [-y]` | **Full uninstall** — destroys everything: containers, panel+DB images, volumes, networks, systemd units, cron jobs, `/opt/zagros`, `/var/lib/zagros` (databases, backups, certificates, logs, runtime data, caches), `/etc/zagros`, the CLI and the root-only host agent. Prints a removal summary first, then verifies nothing is left (second sweep + loud failure on any survivor). |
 
 ### Operations
