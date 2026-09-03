@@ -85,9 +85,13 @@ removed and now return 404).
    release with `--version vX.Y.Z` (pre-releases are only reachable this way,
    or with `--channel prerelease`). `status` / `version` / `doctor` always
    print the release the running image was built from, next to the tag.
-4. With mysql/mariadb/postgresql: waits for the database, then provisions
-   the second `zagros_legacy` database (split-schema design).
-5. Waits for panel health, runs `alembic upgrade head`, verifies the schema
+4. With mysql/mariadb/postgresql: starts the database service **first**,
+   waits until it accepts connections, then provisions the second
+   `zagros_legacy` database (split-schema design).
+5. Starts the panel — which itself waits for the SQL server(s)
+   (`ZAGROS_DB_WAIT_SECONDS`, default 180 s), migrates the schema and boots
+   on the first attempt — then waits for its health (polling the dashboard
+   directly, not only Docker's healthcheck cadence) and verifies the schema
    is at head.
 6. Installs the CLI to `/usr/local/bin/zagros` and, on systemd hosts, activates
    `/usr/local/libexec/zagros-host-agent` plus its path unit. If systemd

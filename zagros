@@ -136,6 +136,23 @@ compose()     { compose_probe
 panel_exec()  { compose exec -T "$SERVICE" "$@"; }
 hostctl()     { panel_exec python3 -m app.platform.hostctl "$@"; }
 
+healthcheck_start_interval_supported() {
+    # `healthcheck.start_interval` (fast probing while a container starts)
+    # needs Compose >= 2.20.2 (schema) AND Engine API >= 1.44 (Docker 25).
+    # Older stacks reject the key outright, which would turn a faster boot
+    # into a failed one — so the template carries it only where it is
+    # understood; elsewhere the CLI's own direct polling (wait_healthy)
+    # still notices a booted service within seconds.
+    local api compose_v
+    api="$(docker version --format '{{.Server.APIVersion}}' 2>/dev/null || true)"
+    [[ "$api" =~ ^[0-9]+\.[0-9]+$ ]] || return 1
+    version_gt "$api" 1.43 || return 1
+    compose_probe
+    compose_v="$("${COMPOSE[@]}" version --short 2>/dev/null || true)"
+    [[ "$compose_v" =~ ^v?[0-9]+(\.[0-9]+)+ ]] || return 1
+    version_gt "$compose_v" 2.20.1
+}
+
 # hostctl_json <args...> — runs hostctl, asserts ok:true, prints payload
 hostctl_json() {
     ensure_cmd jq jq >/dev/null
@@ -301,9 +318,48 @@ wait_healthy() {  # wait_healthy <container> <seconds>
             healthy|running) return 0 ;;
             exited|dead|missing) return 1 ;;
         esac
+        # Docker re-probes a container only once per healthcheck interval,
+        # so a service that came up a second after the last probe stays
+        # "starting" until the next one. Ask the service itself in between
+        # (the same probe its healthcheck runs) and stop waiting the moment
+        # it answers.
+        if [[ "$status" == "starting" || "$status" == "unhealthy" ]]; then
+            case "$name" in
+                "$SERVICE")    panel_answers && return 0 ;;
+                "$DB_SERVICE") db_answers && return 0 ;;
+            esac
+        fi
         sleep 2
     done
     return 1
+}
+
+panel_url() {  # the dashboard URL the container healthcheck probes
+    local port tls_mode scheme=http
+    port="$(env_get UVICORN_PORT)"; port="${port:-8000}"
+    tls_mode="$(env_get TLS_MODE)"; tls_mode="${tls_mode:-auto}"
+    if [[ "$tls_mode" == "on" ]] \
+        || [[ "$tls_mode" == "auto" && -n "$(env_get UVICORN_SSL_CERTFILE)" && -n "$(env_get UVICORN_SSL_KEYFILE)" ]]; then
+        scheme=https
+    fi
+    printf '%s://127.0.0.1:%s/dashboard/' "$scheme" "$port"
+}
+panel_answers() {  # true once the panel serves its dashboard (host network)
+    command -v curl >/dev/null 2>&1 || return 1
+    curl -fsSk -o /dev/null --max-time 3 "$(panel_url)" 2>/dev/null
+}
+db_answers() {  # true once the managed database accepts TCP connections
+    local port; port="$(env_get ZAGROS_DB_PORT)"
+    case "$(env_get ZAGROS_DB_KIND)" in
+        mysql|mariadb)
+            # shellcheck disable=SC2046  # db_client_opts is empty or one flag
+            docker exec -e MYSQL_PWD="$(env_get ZAGROS_DB_ROOT_PASSWORD)" "$DB_SERVICE" \
+                "$(db_client admin)" $(db_client_opts) ping -h127.0.0.1 --port="${port:-3306}" --silent >/dev/null 2>&1 ;;
+        postgresql)
+            docker exec "$DB_SERVICE" pg_isready -q -h 127.0.0.1 -p "${port:-5432}" \
+                -U "$(env_get ZAGROS_DB_USER)" -d zagros >/dev/null 2>&1 ;;
+        *) return 1 ;;
+    esac
 }
 
 panel_version() { hostctl version 2>/dev/null | jq -r '.panel_version // "unknown"' 2>/dev/null || echo unknown; }
@@ -350,10 +406,16 @@ services:
     healthcheck:
       # no env injection → the probe reads UVICORN_PORT from the mounted file
       test: ["CMD", "python3", "-c", "import ssl,urllib.request;d={l.split('=',1)[0].strip():l.split('=',1)[1].strip().strip(chr(34)).strip(chr(39)) for l in open('/code/.env',encoding='utf-8') if '=' in l and not l.lstrip().startswith('#')};p=str(int(d.get('UVICORN_PORT','8000')));m=d.get('TLS_MODE','auto');tls=m=='on' or (m=='auto' and bool(d.get('UVICORN_SSL_CERTFILE')) and bool(d.get('UVICORN_SSL_KEYFILE')));u=('https' if tls else 'http')+'://127.0.0.1:'+p+'/dashboard/';urllib.request.urlopen(u,timeout=3,context=ssl._create_unverified_context() if tls else None).close()"]
+      # Probe every 5 s while the container is starting so a booted panel is
+      # reported healthy within seconds, then back off to the steady cadence.
+      # (The fast start-up probe needs Docker Engine 25+ / Compose 2.20.2+;
+      # the CLI omits that line on older stacks and polls the panel itself
+      # instead — see wait_healthy.)
       interval: 20s
       timeout: 8s
       retries: 6
-      start_period: 45s
+      start_period: 90s
+      start_interval: 5s
 YAML
 )
     case "$db_kind" in
@@ -385,7 +447,8 @@ YAML
       interval: 10s
       timeout: 5s
       retries: 12
-      start_period: 40s
+      start_period: 60s
+      start_interval: 2s
 YAML
 )
             ;;
@@ -411,7 +474,8 @@ YAML
       interval: 10s
       timeout: 5s
       retries: 12
-      start_period: 30s
+      start_period: 60s
+      start_interval: 2s
 YAML
 )
             ;;
@@ -422,6 +486,7 @@ YAML
         -e "s|__IMAGE_REPO__|$IMAGE_REPO|g" \
         -e "s|__DATA_DIR__|$ZAGROS_DATA|g" \
         "$COMPOSE_FILE.tmp"
+    healthcheck_start_interval_supported || sed -i '/^      start_interval: /d' "$COMPOSE_FILE.tmp"
     mv "$COMPOSE_FILE.tmp" "$COMPOSE_FILE"
     chmod 640 "$COMPOSE_FILE"
 }
@@ -497,6 +562,9 @@ ZAGROS_DATABASE_URL=$platform_url
 SQLALCHEMY_DATABASE_URL=$legacy_url
 # SQLALCHEMY_POOL_SIZE=10
 # SQLIALCHEMY_MAX_OVERFLOW=30
+# How long the panel container waits for the SQL server(s) above to accept
+# connections before it migrates and boots (seconds; SQLite never waits).
+# ZAGROS_DB_WAIT_SECONDS=180
 
 # ── security ──
 ZAGROS_SECRET_KEY=$secret
@@ -570,15 +638,24 @@ EOF
     chmod 600 "$ENV_FILE"
 }
 
-db_client() {  # db_client <shell|dump> — the client binary for the active engine
+db_client() {  # db_client <shell|dump|admin> — the client binary for the active engine
     # MariaDB 11 removed the mysql*-named client symlinks, so the MariaDB
     # image ships only mariadb / mariadb-dump / mariadb-admin. MySQL keeps
-    # the historical names. Both clients honour MYSQL_PWD.
+    # the historical names. All clients honour MYSQL_PWD.
     if [[ "$(env_get ZAGROS_DB_KIND)" == "mariadb" ]]; then
-        case "$1" in dump) printf 'mariadb-dump' ;; *) printf 'mariadb' ;; esac
+        case "$1" in dump) printf 'mariadb-dump' ;; admin) printf 'mariadb-admin' ;; *) printf 'mariadb' ;; esac
     else
-        case "$1" in dump) printf 'mysqldump' ;; *) printf 'mysql' ;; esac
+        case "$1" in dump) printf 'mysqldump' ;; admin) printf 'mysqladmin' ;; *) printf 'mysql' ;; esac
     fi
+}
+db_client_opts() {  # extra client flags for the active engine (may be empty)
+    # The MariaDB 11.4+ clients print "WARNING: option --ssl-verify-server-cert
+    # is disabled, because of an insecure passwordless login" on every call
+    # that takes its password from MYSQL_PWD — misleading noise in the
+    # install output (the login IS password-protected; the flag only concerns
+    # TLS verification on a loopback connection inside the db container).
+    [[ "$(env_get ZAGROS_DB_KIND)" == "mariadb" ]] && printf -- '--skip-ssl-verify-server-cert'
+    return 0
 }
 
 provision_legacy_db() {  # second database on the managed db server
@@ -587,8 +664,9 @@ provision_legacy_db() {  # second database on the managed db server
         mysql|mariadb)
             local root_pw
             root_pw="$(env_get ZAGROS_DB_ROOT_PASSWORD)"
+            # shellcheck disable=SC2046  # db_client_opts is empty or one flag
             docker exec -e MYSQL_PWD="$root_pw" "$DB_SERVICE" \
-                "$(db_client shell)" -h127.0.0.1 --port="$(env_get ZAGROS_DB_PORT)" -uroot \
+                "$(db_client shell)" $(db_client_opts) -h127.0.0.1 --port="$(env_get ZAGROS_DB_PORT)" -uroot \
                 -e "CREATE DATABASE IF NOT EXISTS zagros_legacy CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci; GRANT ALL PRIVILEGES ON zagros_legacy.* TO '$(env_get ZAGROS_DB_USER)'@'%'; FLUSH PRIVILEGES;"
             ;;
         postgresql)
@@ -989,15 +1067,26 @@ cmd_install() {
 
     log_step "Pulling images"
     compose pull
-    log_step "Starting services"
-    compose up -d
 
+    # Bring the database up FIRST and only then the panel. Starting both at
+    # once made the panel race a MySQL/MariaDB/PostgreSQL server that was
+    # still initialising: its boot-time migration failed on "connection
+    # refused", the panel then retried against an empty schema for a full
+    # minute before it would even bind its port, and the operator sat at
+    # "Waiting for the panel" for well over a minute on every fresh install.
+    # With the database already answering, the panel migrates and boots on
+    # the first attempt.
     if [[ "$db_kind" != "sqlite" ]]; then
+        log_step "Starting the database"
+        compose up -d "$DB_SERVICE"
         log_step "Waiting for database"
         wait_healthy "$DB_SERVICE" 150 || die "database did not become healthy — see: zagros logs zagros-db"
         provision_legacy_db
         log_ok "Databases ready (zagros + zagros_legacy)"
     fi
+
+    log_step "Starting the panel"
+    compose up -d
 
     log_step "Waiting for the panel"
     if ! wait_healthy "$SERVICE" 240; then
@@ -1582,8 +1671,9 @@ do_backup() {  # do_backup [--logs|--no-logs] → echoes archive path
             port="$(env_get ZAGROS_DB_PORT)"
             local root_pw
             root_pw="$(env_get ZAGROS_DB_ROOT_PASSWORD)"
+            # shellcheck disable=SC2046  # db_client_opts is empty or one flag
             docker exec -e MYSQL_PWD="$root_pw" "$DB_SERVICE" \
-                "$(db_client dump)" -h127.0.0.1 --port="$port" -uroot --single-transaction --routines --triggers \
+                "$(db_client dump)" $(db_client_opts) -h127.0.0.1 --port="$port" -uroot --single-transaction --routines --triggers \
                 --databases zagros zagros_legacy > "$staging/db/databases.sql" \
                 || { rm -rf "$staging"; log_err "$(db_client dump) failed"; return 1; }
             ;;
@@ -1812,8 +1902,9 @@ restore_apply() {  # restore_apply <staging> <db_kind> → 0/1
             local root_pw
             root_pw="$(env_get ZAGROS_DB_ROOT_PASSWORD)"
             provision_legacy_db
+            # shellcheck disable=SC2046  # db_client_opts is empty or one flag
             docker exec -i -e MYSQL_PWD="$root_pw" "$DB_SERVICE" \
-                "$(db_client shell)" -h127.0.0.1 --port="$port" -uroot < "$staging/db/databases.sql" || return 1
+                "$(db_client shell)" $(db_client_opts) -h127.0.0.1 --port="$port" -uroot < "$staging/db/databases.sql" || return 1
             ;;
         postgresql)
             compose up -d "$DB_SERVICE" >/dev/null 2>&1 || true
