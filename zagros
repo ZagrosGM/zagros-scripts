@@ -1118,7 +1118,7 @@ cmd_install() {
     cat <<EOF
 
 Next steps:
-  1. Create the first sudo admin:   zagros create-admin --sudo
+  1. Create the first sudo admin:   zagros advanced create-admin --sudo
   2. Open THE panel (one panel only): http://<server-ip>:$(env_get UVICORN_PORT)/dashboard/
      (cores, routing, outbounds, inbounds, DNS, certificates, sessions and
       devices all live there; Config Studio = its Settings → Advanced Mode)
@@ -2679,27 +2679,14 @@ ${C_BLD}main${C_RST}
   ${C_BLU}version${C_RST}                   ${C_PNK}CLI, image, panel and latest-release versions${C_RST}
   ${C_BLU}help${C_RST}                      ${C_PNK}this help${C_RST}
 
-${C_BLD}advanced${C_RST} ${C_DIM}— zagros advanced <command>${C_RST}
-  ${C_BLU}install${C_RST}                   ${C_PNK}one-command install (--database sqlite|mysql|mariadb|postgresql)${C_RST}
-  ${C_BLU}uninstall${C_RST} ${C_DIM}[--yes]${C_RST}         ${C_PNK}full removal of containers, images, data and this CLI${C_RST}
-  ${C_BLU}rollback${C_RST} ${C_DIM}[--to <tag>]${C_RST}     ${C_PNK}return to a previous version${C_RST}
-  ${C_BLU}start${C_RST} ${C_DIM}|${C_RST} ${C_BLU}stop${C_RST} ${C_DIM}|${C_RST} ${C_BLU}reload${C_RST}     ${C_PNK}finer service control than up/down/restart${C_RST}
-  ${C_BLU}doctor${C_RST} ${C_DIM}[--json]${C_RST}           ${C_PNK}full system report (docker/db/cores/ports/dns/ghcr)${C_RST}
-  ${C_BLU}health${C_RST}                    ${C_PNK}quick composite health probe (exit 1 on failure)${C_RST}
-  ${C_BLU}repair${C_RST}                    ${C_PNK}safe automatic fixes (dirs, env, image, container, schema)${C_RST}
-  ${C_BLU}shell${C_RST}                     ${C_PNK}exec into the panel container${C_RST}
-  ${C_BLU}migrate${C_RST}                   ${C_PNK}run schema migrations now${C_RST}
-  ${C_BLU}sync${C_RST} ${C_DIM}[--core X]${C_RST}           ${C_PNK}re-apply every stored account to enabled cores${C_RST}
-  ${C_BLU}create-admin${C_RST}              ${C_PNK}create a sudo/normal admin${C_RST}
-  ${C_BLU}reset-admin${C_RST}               ${C_PNK}reset an admin's password${C_RST}
-  ${C_BLU}install-host-agent${C_RST}        ${C_PNK}the Settings → Panel Network apply/rollback agent${C_RST}
-  ${C_BLU}backup-service${C_RST}            ${C_PNK}system-only bundle (compose, env, CLI state)${C_RST}
-  ${C_BLU}clean${C_RST} ${C_DIM}[--keep N]${C_RST}          ${C_PNK}prune old backups${C_RST}
-  ${C_BLU}prune${C_RST}                     ${C_PNK}docker image prune + superseded image tags${C_RST}
+${C_BLD}advanced${C_RST} ${C_DIM}— zagros advanced <command>   (zagros advanced help lists them)${C_RST}
+  ${C_DIM}install · uninstall · rollback · start · stop · reload · doctor · health · repair
+  shell · migrate · sync · create-admin · reset-admin · install-host-agent
+  backup-service · clean · prune${C_RST}
 
 ${C_DIM}Everything runs against the REAL services — nothing is simulated.
-Advanced commands are also accepted at the top level, so older scripts and
-docs keep working.${C_RST}
+Advanced commands live ONLY under 'zagros advanced' (one path per command):
+zagros advanced create-admin, zagros advanced reset-admin, …${C_RST}
 Docs: https://github.com/ZagrosGM/zagros-scripts
 EOF
 }
@@ -2847,6 +2834,14 @@ main() {
     if [[ "$cmd" == "advanced" ]]; then
         advanced_main "$@"
         return $?
+    fi
+    # ONE spelling per command: the admin commands live under 'zagros
+    # advanced' only — the top-level aliases duplicated them (two spellings
+    # for one action is how version drift starts). Refuse loudly, and tell
+    # the operator exactly what to type instead of silently doing the job.
+    if [[ "$cmd" == "create-admin" || "$cmd" == "reset-admin" ]]; then
+        log_err "'$cmd' is an advanced command — run: zagros advanced $cmd $*"
+        exit 2
     fi
     dispatch "$cmd" "$@"
 }

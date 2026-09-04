@@ -47,7 +47,7 @@ sudo bash -c "$(curl -fsSL https://raw.githubusercontent.com/ZagrosGM/zagros-scr
 Then:
 
 ```bash
-sudo zagros create-admin --sudo       # first sudo admin
+sudo zagros advanced create-admin --sudo   # first sudo admin
 sudo zagros status                    # service, image, health, cores
 sudo zagros doctor                    # full diagnostic report
 sudo zagros install-core xray         # self-install an official core binary
@@ -162,8 +162,11 @@ Main: `up`, `down`, `restart`, `status`, `logs`, `update`, `cores`, `env`,
 Advanced: `install`, `uninstall`, `rollback`, `start`, `stop`, `reload`,
 `shell`, `health`, `doctor`, `repair`, `migrate`, `sync`, `config`,
 `create-admin`, `reset-admin`, `install-host-agent`, `backup-service`,
-`clean`, `prune`. (They are also accepted at the top level, so older scripts
-and docs keep working.)
+`clean`, `prune`. `zagros help` only *names* them; `zagros advanced help`
+describes each one. Every command has ONE spelling: the advanced ones are
+reached only through `zagros advanced <command>` (so `zagros create-admin`
+and `zagros reset-admin` now point back to `zagros advanced …` instead of
+being silently duplicated).
 
 ### Cores (`zagros cores …`)
 
@@ -247,8 +250,8 @@ When a core is running under the live panel process the answer is
 
 | Command | Description |
 |---|---|
-| `create-admin [--username U] [--password P] [--sudo]` | Create a sudo/normal admin; generates a one-time-shown password when omitted. |
-| `reset-admin [--username U] [--password P]` | Reset an admin's password. |
+| `advanced create-admin [--username U] [--password P] [--sudo]` | Create a sudo/normal admin; generates a one-time-shown password when omitted. |
+| `advanced reset-admin [--username U] [--password P]` | Reset an admin's password. |
 | `config [show]` | Print `/opt/zagros/.env` with secrets masked (`list` is an alias; `show` is the default action). |
 | `config get KEY` | Print one value. |
 | `config set KEY VALUE [--force] [--restart]` | Write one value **in place** (same inode, so the bind mount stays live); guards `ZAGROS_SECRET_KEY` rotation over an existing database (`--force` to override, `--restart` to apply). |
