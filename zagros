@@ -310,12 +310,25 @@ local_image_digest() {  # local_image_digest <tag> → sha256:… (empty if abse
 # --------------------------------------------------------------------------- #
 #  health                                                                     #
 # --------------------------------------------------------------------------- #
-wait_healthy() {  # wait_healthy <container> <seconds>
-    local name="$1" deadline=$(( $(date +%s) + ${2:-120} )) status
+wait_healthy() {  # wait_healthy <container> <seconds> [operator-label]
+    local name="$1" timeout="${2:-120}" label="${3:-}"
+    local started deadline next_notice status now elapsed
+    started="$(date +%s)"
+    deadline=$(( started + timeout ))
+    next_notice=$(( started + 10 ))
     while (( $(date +%s) < deadline )); do
+        [[ "${UPDATE_CANCELLED:-0}" == "1" ]] && return 130
         status="$(docker inspect --format '{{if .State.Health}}{{.State.Health.Status}}{{else}}{{.State.Status}}{{end}}' "$name" 2>/dev/null || echo missing)"
         case "$status" in
-            healthy|running) return 0 ;;
+            healthy) return 0 ;;
+            # A process in a container with no healthcheck is not application
+            # readiness. Probe Zagros/DB directly before accepting "running".
+            running)
+                case "$name" in
+                    "$SERVICE")    panel_answers && return 0 ;;
+                    "$DB_SERVICE") db_answers && return 0 ;;
+                    *) return 0 ;;
+                esac ;;
             exited|dead|missing) return 1 ;;
         esac
         # Docker re-probes a container only once per healthcheck interval,
@@ -328,6 +341,12 @@ wait_healthy() {  # wait_healthy <container> <seconds>
                 "$SERVICE")    panel_answers && return 0 ;;
                 "$DB_SERVICE") db_answers && return 0 ;;
             esac
+        fi
+        now="$(date +%s)"
+        if [[ -n "$label" ]] && (( now >= next_notice )); then
+            elapsed=$(( now - started ))
+            log_info "$label is still starting (${elapsed}s elapsed; container: $status)"
+            next_notice=$(( now + 10 ))
         fi
         sleep 2
     done
@@ -1088,8 +1107,15 @@ cmd_install() {
     log_step "Starting the panel"
     compose up -d
 
-    log_step "Waiting for the panel"
-    if ! wait_healthy "$SERVICE" 240; then
+    # Apply schema before waiting for the application: a new image may require
+    # its new schema during startup, so health-before-migration can deadlock.
+    # Keep output visible so this stage is never mistaken for a hung boot.
+    log_step "Applying schema migration"
+    panel_exec python3 -m alembic upgrade head \
+        || die "schema migration failed — see the Alembic output above"
+
+    log_step "Waiting for the panel (enabled cores are reconciled during startup)"
+    if ! wait_healthy "$SERVICE" 240 "panel"; then
         log_warn "panel not healthy yet — dumping last log lines:"
         compose logs --tail=40 "$SERVICE" >&2 || true
         die "panel failed to become healthy. Investigate with: zagros logs / zagros doctor"
@@ -1098,11 +1124,6 @@ cmd_install() {
     log_step "Verifying schema migration"
     local check
     check="$(hostctl db-check 2>/dev/null || true)"
-    if ! printf '%s' "$check" | jq -e '.up_to_date == true' >/dev/null 2>&1; then
-        log_info "running alembic upgrade head"
-        panel_exec python3 -m alembic upgrade head >/dev/null
-        check="$(hostctl db-check 2>/dev/null || true)"
-    fi
     printf '%s' "$check" | jq -e '.up_to_date == true' >/dev/null 2>&1 \
         || die "schema migration did not converge: $check"
     log_ok "Schema up to date ($(printf '%s' "$check" | jq -r '.alembic_heads[0]'))"
@@ -1423,12 +1444,28 @@ cmd_update() {
     printf '%s\n' "{\"from_tag\": \"$current\", \"from_version\": \"$current_version\", \"to_tag\": \"$version\", \"started_utc\": \"$(date -u +%Y-%m-%dT%H:%M:%SZ)\", \"backup\": \"$backup_path\"}" \
         > "$STATE_DIR/last-update.json"
 
-    if update_apply "$version"; then
+    local apply_rc=0
+    update_apply "$version" || apply_rc=$?
+    if (( apply_rc == 0 )); then
         log_ok "update complete → $(panel_version) (image $(describe_image "$version"))"
         printf '%s\n' "$(jq --arg t "$(date -u +%Y-%m-%dT%H:%M:%SZ)" --arg v "$(image_version_label "$version")" '. + {finished_utc: $t, to_version: $v, result: "ok"}' "$STATE_DIR/last-update.json")" \
             > "$STATE_DIR/last-update.json"
+    elif (( apply_rc == 130 )); then
+        # Ctrl-C is an operator decision, not proof that Alembic or the image
+        # failed. Automatically rolling back here is unsafe: a migration may
+        # already have committed and image rollback does not reverse schema.
+        # Leave the health-gated new container alone and record an exact,
+        # recoverable state instead of entering another interruptible wait.
+        log_warn "update interrupted during: ${UPDATE_STAGE:-unknown stage}"
+        log_warn "automatic rollback was NOT started; the container may still finish booting"
+        log_info "check: zagros status && zagros logs --no-follow"
+        log_info "resume: zagros update --version $version --yes"
+        log_info "manual rollback (if needed): zagros rollback"
+        printf '%s\n' "$(jq --arg t "$(date -u +%Y-%m-%dT%H:%M:%SZ)" --arg s "${UPDATE_STAGE:-unknown}" '. + {finished_utc: $t, result: "interrupted", interrupted_stage: $s}' "$STATE_DIR/last-update.json")" \
+            > "$STATE_DIR/last-update.json" 2>/dev/null || true
+        return 130
     else
-        log_err "update to $version FAILED — rolling back to ${current:-previous state}"
+        log_err "update to $version FAILED during ${UPDATE_STAGE:-unknown stage} — rolling back to ${current:-previous state}"
         rollback_update "$current" "$current_version" "$backup_path"
         die "update failed and was rolled back. See: zagros logs"
     fi
@@ -1451,8 +1488,13 @@ ensure_persistent_core_paths() {
     esac
 }
 
-update_apply() {  # update_apply <tag> → 0 ok / 1 fail
-    local version="$1"
+UPDATE_CANCELLED=0
+UPDATE_STAGE=""
+
+update_apply() {  # update_apply <tag> → 0 ok / 1 failed / 130 interrupted
+    local version="$1" rc=0 interrupted=0
+    UPDATE_CANCELLED=0
+    trap 'UPDATE_CANCELLED=1; interrupted=1' INT
     env_set ZAGROS_IMAGE_TAG "$version"
     ensure_persistent_core_paths
     host_tun_preflight
@@ -1469,18 +1511,56 @@ update_apply() {  # update_apply <tag> → 0 ok / 1 fail
     [[ -f "$COMPOSE_FILE" ]] && old_hash="$(sha256sum "$COMPOSE_FILE" | cut -d' ' -f1)"
     render_compose "$db_kind"
     new_hash="$(sha256sum "$COMPOSE_FILE" | cut -d' ' -f1)"
-    compose pull >/dev/null || { log_err "image pull failed ($version)"; return 1; }
-    if [[ -n "$old_hash" && "$old_hash" != "$new_hash" ]]; then
-        log_info "compose definition changed (template update) → force-recreating containers"
-        compose up -d --force-recreate >/dev/null || { log_err "compose up failed"; return 1; }
-    else
-        compose up -d >/dev/null || { log_err "compose up failed"; return 1; }
+
+    UPDATE_STAGE="pulling image $version"
+    log_step "Pull image $version"
+    compose pull >/dev/null || rc=$?
+
+    if (( rc == 0 )) && (( ! interrupted )); then
+        UPDATE_STAGE="recreating containers"
+        log_step "Recreate containers"
+        if [[ -n "$old_hash" && "$old_hash" != "$new_hash" ]]; then
+            log_info "compose definition changed (template update) → force-recreating containers"
+            compose up -d --force-recreate >/dev/null || rc=$?
+        else
+            compose up -d >/dev/null || rc=$?
+        fi
     fi
-    wait_healthy "$SERVICE" 240 || { log_err "panel did not become healthy"; return 1; }
-    wait_healthy "$DB_SERVICE" 60 >/dev/null 2>&1 || true
-    panel_exec python3 -m alembic upgrade head >/dev/null 2>&1 || { log_err "schema migration failed"; return 1; }
-    hostctl db-check 2>/dev/null | jq -e '.up_to_date == true' >/dev/null 2>&1 \
-        || { log_err "schema not up to date after migration"; return 1; }
+
+    # Migration MUST precede application readiness. Waiting for a new image to
+    # become healthy before upgrading its schema can deadlock whenever startup
+    # itself expects the new schema. Keep Alembic output visible: an operator
+    # must be able to distinguish a one-second migration from core recovery.
+    if (( rc == 0 )) && (( ! interrupted )) && [[ "$db_kind" != "sqlite" ]]; then
+        UPDATE_STAGE="waiting for database readiness"
+        log_step "Wait for database readiness"
+        wait_healthy "$DB_SERVICE" 90 "database" || rc=$?
+    fi
+    if (( rc == 0 )) && (( ! interrupted )); then
+        UPDATE_STAGE="applying schema migration"
+        log_step "Apply schema migration"
+        panel_exec python3 -m alembic upgrade head || rc=$?
+    fi
+    if (( rc == 0 )) && (( ! interrupted )); then
+        UPDATE_STAGE="waiting for panel readiness and core recovery"
+        log_step "Wait for panel readiness (enabled cores are reconciled during startup)"
+        wait_healthy "$SERVICE" 240 "panel" || rc=$?
+    fi
+    if (( rc == 0 )) && (( ! interrupted )); then
+        UPDATE_STAGE="verifying schema"
+        log_step "Verify schema"
+        hostctl db-check 2>/dev/null | jq -e '.up_to_date == true' >/dev/null 2>&1 || rc=$?
+    fi
+
+    trap - INT
+    if (( interrupted )) || (( rc == 130 )) || (( UPDATE_CANCELLED )); then
+        return 130
+    fi
+    if (( rc != 0 )); then
+        log_err "${UPDATE_STAGE:-update step} failed (exit $rc)"
+        return 1
+    fi
+    log_ok "schema current and panel application-ready"
     return 0
 }
 
@@ -1502,10 +1582,12 @@ rollback_update() {  # rollback_update <prev-tag> <prev-version> <backup>
     local prev backup
     prev="$(rollback_target "$1" "$2")"; backup="$3"
     if [[ -n "$prev" ]]; then
+        log_step "Rollback image → $prev"
         env_set ZAGROS_IMAGE_TAG "$prev"
         compose pull >/dev/null 2>&1 || true
         compose up -d >/dev/null 2>&1 || true
-        if wait_healthy "$SERVICE" 180; then
+        log_step "Wait for rolled-back panel readiness"
+        if wait_healthy "$SERVICE" 240 "rolled-back panel"; then
             log_ok "rollback: image $prev is healthy again"
             printf '%s\n' "$(jq '. + {result: "rolled-back"}' "$STATE_DIR/last-update.json")" \
                 > "$STATE_DIR/last-update.json" 2>/dev/null || true
@@ -1546,10 +1628,10 @@ cmd_rollback() {
 # --------------------------------------------------------------- lifecycle ---#
 require_installed() { [[ -f "$COMPOSE_FILE" && -f "$ENV_FILE" ]] || die "Zagros is not installed here (run: zagros install)."; }
 
-cmd_up()      { require_root; require_installed; compose up -d; wait_healthy "$SERVICE" 120 \
+cmd_up()      { require_root; require_installed; compose up -d; wait_healthy "$SERVICE" 240 "panel" \
                 && log_ok "zagros up ($(panel_version))" || die "failed to become healthy — zagros logs"; }
 cmd_down()    { require_root; require_installed; compose down; log_ok "zagros down (containers removed, data kept)"; }
-cmd_start()   { require_root; require_installed; compose start; wait_healthy "$SERVICE" 120 \
+cmd_start()   { require_root; require_installed; compose start; wait_healthy "$SERVICE" 240 "panel" \
                 && log_ok "started ($(panel_version))" || die "failed to start healthy — zagros logs"; }
 cmd_stop()    { require_root; require_installed; compose stop; log_ok "stopped"; }
 cmd_restart() { require_root; require_installed
@@ -1559,14 +1641,16 @@ cmd_restart() { require_root; require_installed
     # by an editor/rename; recreating re-resolves ./.env deterministically.
     log_step "Restart (recreate panel — applies .env)"
     compose up -d --force-recreate "$SERVICE" >/dev/null
-    wait_healthy "$SERVICE" 150 \
+    log_step "Wait for panel readiness (enabled cores are reconciled during startup)"
+    wait_healthy "$SERVICE" 240 "panel" \
         && log_ok "restarted, configuration applied ($(panel_version))" \
         || die "restart unhealthy — zagros logs"; }
 cmd_reload()  {
     require_root; require_installed
     log_step "Reload (same as restart: recreate panel — applies .env)"
     compose up -d --force-recreate "$SERVICE" >/dev/null
-    wait_healthy "$SERVICE" 150 && log_ok "reloaded ($(panel_version))" \
+    log_step "Wait for panel readiness (enabled cores are reconciled during startup)"
+    wait_healthy "$SERVICE" 240 "panel" && log_ok "reloaded ($(panel_version))" \
         || die "reload unhealthy — zagros logs"
 }
 cmd_logs() {
@@ -1708,6 +1792,7 @@ do_backup() {  # do_backup [--logs|--no-logs] → echoes archive path
         --exclude='./cores/softether/runtime/hamcore.se2' \
         --exclude='./cores/softether/runtime/libcedar.so*' \
         --exclude='./cores/softether/runtime/libmayaqua.so*' \
+        --exclude='./cores/*/*.sock' --exclude='./cores/*/*/*.sock' \
         --exclude='./zagros.db' --exclude='./zagros.db-*' \
         --exclude='./legacy.db' --exclude='./legacy.db-*' \
         -czf "$staging/data/panel-data.tar.gz" .)
@@ -1723,7 +1808,7 @@ panel=$(panel_version 2>/dev/null || echo unknown)
 image_tag=$(env_get ZAGROS_IMAGE_TAG)
 db_kind=$db_kind
 created_utc=$ts
-exclusions=cores/*/bin, cores/*/assets and SoftEther runtime binaries (self-installable; vpn_server.config retained), ./db (dumped separately), $( (( with_logs )) || echo "./logs," )./backups
+exclusions=cores/*/bin, cores/*/assets, transient core sockets and SoftEther runtime binaries (self-installable; vpn_server.config retained), ./db (dumped separately), $( (( with_logs )) || echo "./logs," )./backups
 EOF
     write_manifest "$staging"
     tar -czf "$archive.tmp" -C "$staging" .

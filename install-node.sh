@@ -366,19 +366,30 @@ else
     --env-file "$INSTALL_DIR/.env" "$IMAGE"
 fi
 
-printf '    waiting for the agent'
-HEALTHY=0
+printf '    waiting for the bootstrap/info endpoint'
+INFO_READY=0
 for _ in $(seq 1 60); do
-  if curl -fsS "http://127.0.0.1:${API_PORT}/healthz" >/dev/null 2>&1; then HEALTHY=1; break; fi
+  if curl -fsS "http://127.0.0.1:${API_PORT}/healthz" >/dev/null 2>&1; then INFO_READY=1; break; fi
   printf '.'; sleep 1
 done
 printf '\n'
-[ "$HEALTHY" -eq 1 ] || {
-  warn "the agent has not answered on the info port yet — showing recent logs:"
+[ "$INFO_READY" -eq 1 ] || {
+  warn "the agent has not answered on the bootstrap/info port — showing recent logs:"
   docker logs --tail 40 zagros-node 2>/dev/null || true
-  die "node did not become healthy (see the logs above; try: zagros-node logs)"
+  die "node bootstrap failed (see the logs above; try: zagros-node logs)"
 }
-ok "agent is listening on :$PORT (control plane) and :$API_PORT (info)"
+ok "bootstrap/info endpoint is listening on :$API_PORT"
+
+# The info endpoint intentionally binds before persisted cores are restored.
+# That makes install/discovery reliable even when SoftEther/OpenVPN startup is
+# slow.  Do not claim the signed control plane is ready merely because Docker
+# says the container started or because the independent info port answered.
+if timeout 2 bash -c "</dev/tcp/127.0.0.1/$PORT" >/dev/null 2>&1; then
+  ok "signed control plane is listening on :$PORT"
+else
+  warn "the signed control plane on :$PORT is still restoring enabled cores"
+  warn "the install is intact; follow 'zagros-node logs -f' and retry Connect in the panel shortly"
+fi
 
 # --------------------------------------------------------------------------- #
 step "Pairing material — copy this into the panel"
