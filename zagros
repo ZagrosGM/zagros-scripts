@@ -25,7 +25,7 @@
 # =============================================================================
 set -euo pipefail
 
-ZAGROS_CLI_VERSION="1.1.0"
+ZAGROS_CLI_VERSION="1.1.1"
 SCRIPTS_REPO_RAW="https://raw.githubusercontent.com/ZagrosGM/zagros-scripts"
 PANEL_REPO="ZagrosGM/Zagros"
 PANEL_API="https://api.github.com/repos/${PANEL_REPO}"
@@ -134,6 +134,15 @@ compose()     { compose_probe
                     "${COMPOSE[@]}" -f "$COMPOSE_FILE" "$@"
                 fi }
 panel_exec()  { compose exec -T "$SERVICE" "$@"; }
+# f-instlock-1: run Alembic under the SAME in-container flock the image boot
+# pipeline takes (/tmp/.zagros-migrate.lock). Boot (dbmerge + alembic) and the
+# CLI's exec migrations must never overlap: unsynchronized, a fresh install
+# could crash (v1.1.1: 0004 inspected the legacy schema right after the boot
+# dbmerge dropped it → NoSuchTableError: admins). The subshell releases the
+# lock on exit; `flock` serializes whoever comes second.
+guarded_migrate() {
+    panel_exec bash -c 'exec 9>/.zagros-migrate.lock; flock 9; python3 -m alembic upgrade head"$@"' run-migrate "$@"
+}
 hostctl()     { panel_exec python3 -m app.platform.hostctl "$@"; }
 
 healthcheck_start_interval_supported() {
@@ -1111,7 +1120,7 @@ cmd_install() {
     # its new schema during startup, so health-before-migration can deadlock.
     # Keep output visible so this stage is never mistaken for a hung boot.
     log_step "Applying schema migration"
-    panel_exec python3 -m alembic upgrade head \
+    guarded_migrate \
         || die "schema migration failed — see the Alembic output above"
 
     log_step "Waiting for the panel (enabled cores are reconciled during startup)"
@@ -1539,7 +1548,7 @@ update_apply() {  # update_apply <tag> → 0 ok / 1 failed / 130 interrupted
     if (( rc == 0 )) && (( ! interrupted )); then
         UPDATE_STAGE="applying schema migration"
         log_step "Apply schema migration"
-        panel_exec python3 -m alembic upgrade head || rc=$?
+        guarded_migrate || rc=$?
     fi
     if (( rc == 0 )) && (( ! interrupted )); then
         UPDATE_STAGE="waiting for panel readiness and core recovery"
@@ -2008,7 +2017,7 @@ restore_apply() {  # restore_apply <staging> <db_kind> → 0/1
 
     compose up -d >/dev/null 2>&1 || true
     wait_healthy "$SERVICE" 200 || { log_err "panel unhealthy after restore"; return 1; }
-    panel_exec python3 -m alembic upgrade head >/dev/null 2>&1 || log_warn "post-restore migration reported issues (check: zagros migrate)"
+    guarded_migrate >/dev/null 2>&1 || log_warn "post-restore migration reported issues (check: zagros migrate)"
     hostctl db-check 2>/dev/null | jq -e '.reachable == true' >/dev/null 2>&1 \
         || { log_err "database not reachable after restore"; return 1; }
     return 0
@@ -2018,7 +2027,7 @@ restore_apply() {  # restore_apply <staging> <db_kind> → 0/1
 cmd_migrate() {
     require_root; require_installed
     log_step "alembic upgrade head"
-    panel_exec python3 -m alembic upgrade head
+    guarded_migrate
     panel_exec python3 -m alembic current
     cmd_health >/dev/null && log_ok "migration complete & healthy" || die "migration ran but health check failed — zagros doctor"
 }
@@ -2383,7 +2392,7 @@ cmd_repair() {
     fi
 
     log_step "Schema + live reconciliation verdict"
-    panel_exec python3 -m alembic upgrade head >/dev/null \
+    guarded_migrate >/dev/null \
         || { log_err "schema migration failed${backup_path:+; safety backup: $backup_path}"; return 1; }
 
     local report="$ZAGROS_DATA/runtime-boot-report.json" ready=0
