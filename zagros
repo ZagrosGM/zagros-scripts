@@ -453,6 +453,7 @@ YAML
     # runtime maintains under <data>/build-worker/, so a fresh install can
     # build apps without any operator steps.
     aux_svc=$(cat <<'YAML'
+
   zagros-redis:
     image: redis:7-alpine
     container_name: zagros-redis
