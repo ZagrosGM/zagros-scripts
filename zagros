@@ -25,7 +25,7 @@
 # =============================================================================
 set -euo pipefail
 
-ZAGROS_CLI_VERSION="1.1.1"
+ZAGROS_CLI_VERSION="1.1.2"
 SCRIPTS_REPO_RAW="https://raw.githubusercontent.com/ZagrosGM/zagros-scripts"
 PANEL_REPO="ZagrosGM/Zagros"
 PANEL_API="https://api.github.com/repos/${PANEL_REPO}"
@@ -397,7 +397,7 @@ panel_version() { hostctl version 2>/dev/null | jq -r '.panel_version // "unknow
 # --------------------------------------------------------------------------- #
 render_compose() {  # render_compose <db-kind> — writes $COMPOSE_FILE
     local db_kind="$1"
-    local panel_svc db_svc
+    local panel_svc db_svc aux_svc
     panel_svc=$(cat <<'YAML'
 services:
   zagros:
@@ -444,6 +444,48 @@ services:
       retries: 6
       start_period: 90s
       start_interval: 5s
+YAML
+)
+    # f-buildzero-1: the build stack ships WITH the panel — a Redis queue
+    # (loopback-only, ephemeral) and the compose-managed worker container
+    # (image: full Flutter/Android toolchain + the zagros_builder agent).
+    # The worker enrolls itself from the register-token file the panel
+    # runtime maintains under <data>/build-worker/, so a fresh install can
+    # build apps without any operator steps.
+    aux_svc=$(cat <<'YAML'
+  zagros-redis:
+    image: redis:7-alpine
+    container_name: zagros-redis
+    restart: unless-stopped
+    network_mode: host
+    command: ["redis-server", "--save", "", "--appendonly", "no"]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 12
+
+  zagros-build-worker:
+    image: ghcr.io/zagrosgm/zagros-build-worker:${ZAGROS_BUILD_WORKER_TAG:-latest}
+    container_name: zagros-build-worker
+    restart: unless-stopped
+    network_mode: host
+    environment:
+      ZAGROS_REDIS_URL: ${ZAGROS_REDIS_URL:-redis://127.0.0.1:6379/0}
+      ZAGROS_WORKER_ID: local-pool-01
+      ZAGROS_WORKER_LABELS: linux
+      ZAGROS_WORKER_STATE_DIR: /var/lib/zagros/build-worker
+      # no ZAGROS_PANEL_URL here: the entrypoint computes the loopback URL
+      # from the mounted .env (same TLS auto rule as the healthcheck), so
+      # `zagros config edit` + restart keeps the worker in sync.
+    volumes:
+      - __DATA_DIR__/build-worker:/var/lib/zagros/build-worker
+      - ./.env:/code/.env:ro
+    depends_on:
+      zagros:
+        condition: service_started
+      zagros-redis:
+        condition: service_healthy
 YAML
 )
     case "$db_kind" in
@@ -509,7 +551,7 @@ YAML
             ;;
         *) db_svc="" ;;
     esac
-    printf '%s%s\n' "$panel_svc" "$db_svc" > "$COMPOSE_FILE.tmp"
+    printf '%s%s%s\n' "$panel_svc" "$aux_svc" "$db_svc" > "$COMPOSE_FILE.tmp"
     sed -i \
         -e "s|__IMAGE_REPO__|$IMAGE_REPO|g" \
         -e "s|__DATA_DIR__|$ZAGROS_DATA|g" \
@@ -584,6 +626,12 @@ TLS_MODE=auto
 # UVICORN_SSL_CA_CERTFILE=/var/lib/zagros/certs/ca.pem
 # UVICORN_SSL_CA_TYPE=public
 # UVICORN_UDS=
+
+# ── build system (white-label apps) ──
+# The Redis queue and the build worker ship with the panel — nothing to
+# configure. Pin the worker image with ZAGROS_BUILD_WORKER_TAG if needed.
+ZAGROS_REDIS_URL=redis://127.0.0.1:6379/0
+# ZAGROS_BUILD_WORKER_TAG=latest
 
 # ── database ──
 ZAGROS_DATABASE_URL=$platform_url
@@ -1211,7 +1259,7 @@ uninstall_summary() {
     local containers images volumes networks units crons cache
     containers=$(docker ps -a --format '{{.Names}}' 2>/dev/null | grep -c '^zagros' || true)
     images=$(docker images --format '{{.Repository}}' 2>/dev/null \
-        | grep -cE "^(ghcr\.io/zagrosgm/zagros|mysql|mariadb|postgres)$" || true)
+        | grep -cE "^(ghcr\.io/zagrosgm/zagros|mysql|mariadb|postgres|redis|ghcr\.io/zagrosgm/zagros-build-worker)$" || true)
     volumes=$(docker volume ls --format '{{.Name}}' 2>/dev/null | grep -c '^zagros' || true)
     networks=$(docker network ls --format '{{.Name}}' 2>/dev/null | grep -c '^zagros' || true)
     units=$(_u_systemd_units | grep -c . || true)
@@ -1314,7 +1362,7 @@ uninstall_verify() {
     found=$(docker ps -a --format '{{.Names}}' 2>/dev/null | grep '^zagros' || true)
     [[ -n "$found" ]] && leftovers+=("containers: $(tr '\n' ' ' <<<"$found")")
     found=$(docker images --format '{{.Repository}}' 2>/dev/null \
-        | grep -E "^(ghcr\.io/zagrosgm/zagros|mysql|mariadb|postgres)$" || true)
+        | grep -E "^(ghcr\.io/zagrosgm/zagros|mysql|mariadb|postgres|redis|ghcr\.io/zagrosgm/zagros-build-worker)$" || true)
     [[ -n "$found" ]] && leftovers+=("images: $(tr '\n' ' ' <<<"$found")")
     found=$(docker volume ls --format '{{.Name}}' 2>/dev/null | grep '^zagros' || true)
     [[ -n "$found" ]] && leftovers+=("volumes: $(tr '\n' ' ' <<<"$found")")
@@ -1340,7 +1388,7 @@ uninstall_verify() {
             < <(docker ps -a --format '{{.Names}}' 2>/dev/null | grep '^zagros' || true)
         while read -r i; do [[ -n "$i" ]] && docker rmi -f "$i" >/dev/null 2>&1 || true; done \
             < <(docker images --format '{{.Repository}}:{{.Tag}}' 2>/dev/null \
-                 | grep -E '^(ghcr\.io/zagrosgm/zagros|mysql|mariadb|postgres):' || true)
+                 | grep -E '^(ghcr\.io/zagrosgm/zagros|mysql|mariadb|postgres|redis|ghcr\.io/zagrosgm/zagros-build-worker):' || true)
         while read -r v; do [[ -n "$v" ]] && docker volume rm -f "$v" >/dev/null 2>&1 || true; done \
             < <(docker volume ls --format '{{.Name}}' 2>/dev/null | grep '^zagros' || true)
         while read -r n; do [[ -n "$n" ]] && docker network rm "$n" >/dev/null 2>&1 || true; done \
@@ -1505,6 +1553,10 @@ update_apply() {  # update_apply <tag> → 0 ok / 1 failed / 130 interrupted
     UPDATE_CANCELLED=0
     trap 'UPDATE_CANCELLED=1; interrupted=1' INT
     env_set ZAGROS_IMAGE_TAG "$version"
+    # f-buildzero-1: installs older than the build-stack default gain the
+    # queue URL here (the compose template interpolates it).
+    grep -qE "^ZAGROS_REDIS_URL=." "$ENV_FILE" 2>/dev/null \
+        || printf '\n# ── build system (white-label apps) ──\nZAGROS_REDIS_URL=redis://127.0.0.1:6379/0\n# ZAGROS_BUILD_WORKER_TAG=latest\n' >> "$ENV_FILE"
     ensure_persistent_core_paths
     host_tun_preflight
     # The compose TEMPLATE evolves between CLI releases (e.g. 1.0.0-alpha.7.2
@@ -2197,6 +2249,26 @@ cmd_doctor() {
         fi
     else
         dr FAIL "database" "panel db-check failed (container healthy?)"
+    fi
+
+    # --- build stack (f-buildzero-1): queue + local worker
+    if docker ps --format '{{.Names}} {{.State}}' 2>/dev/null | grep -q '^zagros-redis running$' \
+        && docker exec zagros-redis redis-cli ping 2>/dev/null | grep -q PONG; then
+        dr OK "build queue (redis)" "loopback-only, ephemeral"
+    else
+        dr FAIL "build queue (redis)" "zagros-redis not running — white-label builds will fail to dispatch"
+    fi
+    local wstate wline
+    wline="$(docker ps --format '{{.Names}} {{.Status}}' 2>/dev/null | grep '^zagros-build-worker ' || true)"
+    if [[ -n "$wline" ]]; then
+        wstate="$(printf '%s' "$wline" | grep -o 'Up [^(]*' | head -1)"
+        if [[ -n "$(docker exec zagros-build-worker sh -c 'test -s /var/lib/zagros/build-worker/worker.token && echo ok' 2>/dev/null)" ]]; then
+            dr OK "build worker" "zagros-build-worker ${wstate:-running} (enrolled)"
+        else
+            dr WARN "build worker" "running, not enrolled yet (waits for the panel's register token)"
+        fi
+    else
+        dr FAIL "build worker" "zagros-build-worker not running — white-label builds will never start"
     fi
 
     # --- cores
