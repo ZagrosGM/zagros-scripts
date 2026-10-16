@@ -2775,8 +2775,22 @@ cmd_reload_core() {
 
 cmd_sync() {
     require_root; require_installed
-    local args=(sync)
-    [[ -n "${1:-}" ]] && args+=(--core "$1")
+    # f-softsync-1: help advertises `sync [--core X]`, so `--core X` and
+    # `--core=X` must parse — while the historical positional form keeps
+    # working (older runbooks use `zagros sync softether`). The old code
+    # blindly appended `$1`, so `zagros sync --core softether` asked hostctl
+    # for `sync --core --core` and failed.
+    local core="" args=(sync)
+    while (($#)); do
+        case "$1" in
+            --core)    [[ -n "${2:-}" ]] || die "--core requires a value"; core="$2"; shift 2 ;;
+            --core=*)  core="${1#*=}"; shift ;;
+            -h|--help) advanced_help; return 0 ;;
+            *)         if [[ -z "$core" ]]; then core="$1"; shift
+                       else die "unexpected argument: $1"; fi ;;
+        esac
+    done
+    [[ -n "$core" ]] && args+=(--core "$core")
     log_step "Sync: re-applying stored accounts to all enabled cores"
     hostctl_json "${args[@]}" | jq -r '.cores | to_entries[] |
         if .value.error then "  \(.key): ERROR — \(.value.error)"
