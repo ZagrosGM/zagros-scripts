@@ -1357,6 +1357,44 @@ uninstall_filesystem_sweep() {
     log_ok "removed $ZAGROS_HOME, $ZAGROS_DATA, $ZAGROS_ETC, units, cron jobs, cache, CLI and host agent"
 }
 
+uninstall_kernel_sweep() {
+    log_step "kernel sweep (Zagros-owned links, nftables table, mzwg rules)"
+    # f-wgleftover-1: host-network cores create links in the HOST kernel;
+    # removing the container cannot delete them, so a leftover mzwg0 made the
+    # next install's WireGuard start fail with no recovery. ONLY the
+    # Zagros-owned prefix is touched — generic tun*/tap* devices may belong
+    # to unrelated VPN software and are never deleted here.
+    if command -v ip >/dev/null 2>&1; then
+        local l
+        while read -r l; do
+            [[ -n "$l" ]] || continue
+            ip link del "$l" >/dev/null 2>&1 \
+                && log_info "removed kernel link: $l" \
+                || log_warn "could not remove kernel link: $l"
+        done < <(ip -o link show 2>/dev/null | awk -F': ' '$2 ~ /^mzwg[0-9]+$/ {print $2}')
+    fi
+    # the policy-routing nftables table is fully Zagros-owned
+    if command -v nft >/dev/null 2>&1 && nft list table inet zagros_policy >/dev/null 2>&1; then
+        nft delete table inet zagros_policy >/dev/null 2>&1 \
+            && log_info "removed nftables table: inet zagros_policy"
+    fi
+    # iptables rules that reference a Zagros WireGuard interface
+    if command -v iptables >/dev/null 2>&1 && command -v iptables-save >/dev/null 2>&1; then
+        local spec chain spec_args t rule
+        while read -r rule; do
+            [[ "$rule" == *mzwg* ]] || continue
+            t="filter"; [[ "$rule" == '-A nat'* || "$rule" == '-A "*nat"'* ]] && t="nat"
+            chain="${rule#-A }"; chain="${chain%% *}"
+            spec_args="${rule#-A ${chain}}"; spec_args="${spec_args# }"
+            # delete every duplicate of the same rule
+            while iptables -t "$t" -C "$chain" $spec_args >/dev/null 2>&1; do
+                iptables -t "$t" -D "$chain" $spec_args >/dev/null 2>&1 || true
+            done
+            log_info "removed iptables ${t}/${chain} rule referencing mzwg"
+        done < <(iptables-save 2>/dev/null | grep '^-A ' | grep 'mzwg' || true)
+    fi
+}
+
 uninstall_verify() {
     log_step "verifying nothing is left"
     local leftovers=() found
@@ -1424,6 +1462,10 @@ uninstall_verify() {
         [[ -e "$HOME/.cache/zagros" ]] && leftovers+=("$HOME/.cache/zagros")
         [[ $(docker ps -a --format '{{.Names}}' 2>/dev/null | grep -c '^zagros' || true) == "0" ]] \
             || leftovers+=("docker containers")
+        if command -v ip >/dev/null 2>&1; then
+            found=$(ip -o link show 2>/dev/null | awk -F': ' '$2 ~ /^mzwg[0-9]+$/ {print $2}' | tr '\n' ' ')
+            [[ -n "$found" ]] && leftovers+=("kernel links: $found")
+        fi
         [[ -z "$(_u_systemd_units)" ]] || leftovers+=("systemd units")
         [[ -z "$(_u_cron_files)" ]] || leftovers+=("cron jobs")
         ((${#leftovers[@]})) && die "uninstall incomplete, still present: ${leftovers[*]} — remove manually and report."
@@ -1444,6 +1486,7 @@ cmd_uninstall() {
     uninstall_summary
     (( yes )) || confirm "Proceed with FULL uninstall (everything above will be destroyed)?" || die "aborted."
     uninstall_docker_sweep
+    uninstall_kernel_sweep
     uninstall_filesystem_sweep
     uninstall_verify
     log_ok "Zagros fully uninstalled — the system is clean."
