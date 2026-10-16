@@ -2794,6 +2794,32 @@ cmd_update_core() {
     fi
 }
 
+cmd_core_power() {  # f-coresstart-cli: `cores start|stop <core>` (FR)
+    require_root; require_installed
+    local action="$1"; shift || true
+    local core="$1"; shift || true
+    [[ -n "$core" ]] || die "usage: zagros cores $action <core>"
+    local verb="cores-$action"
+    local past="started"
+    [[ "$action" == "stop" ]] && past="stopped"
+    local out rc
+    set +e
+    out="$(hostctl "$verb" "$core" 2>/dev/null)"; rc=$?
+    set -e
+    case "$rc" in
+        0) printf '%s\n' "$out" | jq -r "\"core \\(.core) ${past} (\\(.state))\"" ;;
+        3)
+            log_step "core runs under the live panel — reloading the service"
+            compose restart "$SERVICE" >/dev/null
+            wait_healthy "$SERVICE" 150 \
+                && log_ok "panel reloaded; core '$core' $past with it" \
+                || die "panel slow after reload — zagros logs"
+            ;;
+        4) die "core '$core' is not installed" ;;
+        *) printf '%s\n' "$out" >&2; die "cores $action failed" ;;
+    esac
+}
+
 cmd_reload_core() {
     require_root; require_installed
     local core="$1"; shift || true
@@ -2952,6 +2978,8 @@ cmd_cores() {
         update|upgrade)         cmd_update_core "$@" ;;
         uninstall|remove|rm)    cmd_uninstall_core "$@" ;;
         reload|restart)         cmd_reload_core "$@" ;;
+        start)                  cmd_core_power start "$@" ;;
+        stop)                   cmd_core_power stop "$@" ;;
         -h|--help|help)
             cat <<EOF
 ${C_BLD}zagros cores${C_RST} <action> [core] [options]
@@ -2961,6 +2989,8 @@ ${C_BLD}zagros cores${C_RST} <action> [core] [options]
   ${C_BLU}update${C_RST} ${C_DIM}<core>${C_RST}             ${C_PNK}update a core — --version X pins one release${C_RST}
   ${C_BLU}uninstall${C_RST} ${C_DIM}<core>${C_RST}          ${C_PNK}dependency-checked removal (--purge/--force)${C_RST}
   ${C_BLU}reload${C_RST} ${C_DIM}<core>${C_RST}             ${C_PNK}restart a single core (panel-aware)${C_RST}
+  ${C_BLU}start${C_RST} ${C_DIM}<core>${C_RST}              ${C_PNK}start one core (panel-aware)${C_RST}
+  ${C_BLU}stop${C_RST} ${C_DIM}<core>${C_RST}               ${C_PNK}stop one core (panel-aware)${C_RST}
 EOF
             ;;
         *) log_err "unknown cores action: $sub"; echo; cmd_cores help; exit 2 ;;
