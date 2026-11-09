@@ -167,6 +167,12 @@ hostctl_json() {
     ensure_cmd jq jq >/dev/null
     local out
     if ! out="$(hostctl "$@" 2>/dev/null)"; then
+        # The panel answered with a structured error (e.g. "Core 'xray' is
+        # already installed.") — show it instead of guessing that the
+        # container is down.
+        local err
+        err="$(printf '%s' "$out" | jq -r 'select(type == "object") | .error // empty' 2>/dev/null | head -1)"
+        [[ -n "$err" ]] && die "$err"
         hostctl "$@" >/dev/null 2>&1 || true
         die "panel operation failed: hostctl $* (panel container running? try: zagros status)"
     fi
@@ -459,7 +465,13 @@ YAML
     container_name: zagros-redis
     restart: unless-stopped
     network_mode: host
-    command: ["redis-server", "--save", "", "--appendonly", "no"]
+    # network_mode: host → nothing but these flags keeps Redis off the
+    # public interface and the VPN tunnels. The official image disables
+    # protected-mode and binds *, expecting Docker port publishing to
+    # limit access, which host networking does not do (BSI/CERT-Bund
+    # "open Redis" reports; RQ jobs are deserialised from here).
+    command: ["redis-server", "--save", "", "--appendonly", "no",
+              "--bind", "127.0.0.1", "-::1", "--protected-mode", "yes"]
     healthcheck:
       test: ["CMD", "redis-cli", "ping"]
       interval: 10s
@@ -505,7 +517,10 @@ YAML
     container_name: zagros-db
     restart: always
     network_mode: host
-    command: ["--port=\${ZAGROS_DB_PORT:-3306}", "--character-set-server=utf8mb4", "--collation-server=utf8mb4_unicode_ci"]
+    # host networking: bind to loopback unless the operator explicitly sets
+    # ZAGROS_DB_LISTEN in .env (the image would otherwise listen on every
+    # interface, root@'%' included)
+    command: ["--port=\${ZAGROS_DB_PORT:-3306}", "--bind-address=\${ZAGROS_DB_LISTEN:-127.0.0.1}", "--character-set-server=utf8mb4", "--collation-server=utf8mb4_unicode_ci"]
     environment:
       MYSQL_ROOT_PASSWORD: \${ZAGROS_DB_ROOT_PASSWORD:?set ZAGROS_DB_ROOT_PASSWORD in .env}
       MYSQL_DATABASE: zagros
@@ -533,7 +548,10 @@ YAML
     container_name: zagros-db
     restart: always
     network_mode: host
-    command: ["-p", "${ZAGROS_DB_PORT:-5432}"]
+    # host networking: the image sets listen_addresses='*' — keep the
+    # database on loopback unless the operator explicitly sets
+    # ZAGROS_DB_LISTEN in .env
+    command: ["-p", "${ZAGROS_DB_PORT:-5432}", "-c", "listen_addresses=${ZAGROS_DB_LISTEN:-localhost}"]
     environment:
       POSTGRES_DB: zagros
       POSTGRES_USER: ${ZAGROS_DB_USER:-zagros}
@@ -2131,6 +2149,15 @@ cmd_migrate() {
 # ----------------------------------------------------------------- doctor ---#
 _DOCTOR_REPORT=""
 _DOCTOR_JSON=0
+listen_exposed() {  # listen_exposed <port> → non-loopback TCP listen addresses ("" = loopback-only); rc 2 without ss
+    command -v ss >/dev/null 2>&1 || return 2
+    ss -H -lnt "sport = :$1" 2>/dev/null | awk '{print $4}' \
+        | sed -E 's/:[0-9]+$//' \
+        | grep -vE '^(127\.[0-9.]+|\[::1\]|::1|\[::ffff:127\.[0-9.]+\])$' \
+        | sort -u | tr '\n' ' '
+    return 0
+}
+
 dr() {  # dr <status> <check> <detail> — record + print
     local status="$1" check="$2" detail="$3"
     if (( _DOCTOR_JSON )); then
@@ -2294,11 +2321,35 @@ cmd_doctor() {
     else
         dr FAIL "database" "panel db-check failed (container healthy?)"
     fi
+    local dbk dbp dbexp
+    dbk="$(env_get ZAGROS_DB_KIND)"
+    case "$dbk" in
+        postgresql)    dbp="$(env_get ZAGROS_DB_PORT)"; dbp="${dbp:-5432}" ;;
+        mysql|mariadb) dbp="$(env_get ZAGROS_DB_PORT)"; dbp="${dbp:-3306}" ;;
+        *)             dbp="" ;;
+    esac
+    if [[ -n "$dbp" ]] && dbexp="$(listen_exposed "$dbp")"; then
+        if [[ -z "$dbexp" ]]; then
+            dr OK "database port" "$dbk ${dbp}/tcp loopback-only (verified)"
+        elif [[ -n "$(env_get ZAGROS_DB_LISTEN)" ]]; then
+            dr WARN "database port" "$dbk listens on ${dbexp% } (ZAGROS_DB_LISTEN is set) — restrict ${dbp}/tcp with a firewall"
+        else
+            dr WARN "database port" "$dbk listens on ${dbexp% } — reachable from the network and VPN clients (password-only); 'zagros repair' re-renders it loopback-only"
+        fi
+    fi
 
     # --- build stack (f-buildzero-1): queue + local worker
     if docker ps --format '{{.Names}} {{.State}}' 2>/dev/null | grep -q '^zagros-redis running$' \
         && docker exec zagros-redis redis-cli ping 2>/dev/null | grep -q PONG; then
-        dr OK "build queue (redis)" "loopback-only, ephemeral"
+        local rexp rpm
+        rpm="$(docker exec zagros-redis redis-cli CONFIG GET protected-mode 2>/dev/null | sed -n 2p)"
+        if ! rexp="$(listen_exposed 6379)"; then
+            dr WARN "build queue (redis)" "running; listen addresses not verified (ss missing)"
+        elif [[ -n "$rexp" ]]; then
+            dr FAIL "build queue (redis)" "listening on ${rexp% } (protected-mode ${rpm:-?}, no password) — reachable from the network and VPN clients; 'zagros repair' re-renders it loopback-only"
+        else
+            dr OK "build queue (redis)" "loopback-only (verified), protected-mode ${rpm:-?}"
+        fi
     else
         dr FAIL "build queue (redis)" "zagros-redis not running — white-label builds will fail to dispatch"
     fi
@@ -2489,6 +2540,12 @@ cmd_repair() {
         compose up -d "$DB_SERVICE" >/dev/null || die "database service could not start"
         wait_healthy "$DB_SERVICE" 150 || die "database service did not become healthy"
         provision_legacy_db
+    fi
+    # The build stack follows the re-rendered spec too (e.g. Redis'
+    # loopback/protected-mode flags); compose only recreates what changed.
+    if [[ "$old_hash" != "$new_hash" ]]; then
+        compose up -d zagros-redis zagros-build-worker >/dev/null 2>&1 \
+            || log_warn "build queue/worker could not be recreated (white-label builds only)"
     fi
 
     # Remove the previous verdict and force one clean process generation.
